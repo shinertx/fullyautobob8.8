@@ -39,7 +39,7 @@ def benjamini_hochberg(pvals: List[float], alpha: float):
             thresh = max(thresh, pvals[idx])
     return accept, thresh
 
-def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: int, alpha_fdr: float):
+def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: int, alpha_fdr: float, cv_method: str = "kfold"):
     """Aggregate panel cross-validation statistics with purged K-fold and FDR gate helper.
 
     PIT: Operates strictly on historical returns; ensures variance guard.
@@ -50,7 +50,25 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: i
         if s.empty or len(s) < max(20, k_folds*5): continue
         n = len(s)
         folds = purged_kfold_indices(n, k_folds, embargo)
-        oos_chunks = [s.iloc[test_idx] for _, test_idx in folds]
+        if cv_method and str(cv_method).lower() == "cpcv" and k_folds > 1:
+            # Combinatorial Purged CV: generate combinations of test folds (e.g. pairs) as additional OOS scenarios
+            comb_folds = []
+            for i in range(k_folds):
+                for j in range(i+1, k_folds):
+                    test_idx = np.concatenate([folds[i][1], folds[j][1]])
+                    test_idx = np.unique(test_idx)
+                    test_idx.sort()
+                    train_mask = np.ones(n, dtype=bool)
+                    emb_lo_i = max(0, folds[i][1][0] - embargo); emb_hi_i = min(n, folds[i][1][-1] + 1 + embargo)
+                    train_mask[emb_lo_i:emb_hi_i] = False
+                    emb_lo_j = max(0, folds[j][1][0] - embargo); emb_hi_j = min(n, folds[j][1][-1] + 1 + embargo)
+                    train_mask[emb_lo_j:emb_hi_j] = False
+                    train_mask[test_idx] = False
+                    comb_folds.append((np.where(train_mask)[0], test_idx))
+            folds_to_use = comb_folds
+        else:
+            folds_to_use = folds
+        oos_chunks = [s.iloc[test_idx] for _, test_idx in folds_to_use]
         if oos_chunks: all_oos.append(pd.concat(oos_chunks))
     if not all_oos:
         return {"p_value": 1.0, "mean_oos": 0.0, "n": 0}

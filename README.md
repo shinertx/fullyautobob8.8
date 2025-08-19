@@ -104,13 +104,26 @@ cd v26meme
 
 ---
 
-## 🔄 Recent Enhancements (still v4.7.5)
+## 🔄 Recent Enhancements
 
-* Dynamic, self-healing venue symbol mapping (falls back to static YAML) reduces symbol rot.
-* Harvester: Removed insecure eval() for EIL ingestion (safe JSON / literal parser).
-* Harvester: Timestamp coercion + non-finite filtering before QA gate.
-* LLM proposer: HTTP error surfacing (raise_for_status) + telemetry counters.
-* Dashboard banner clarifies dynamic mapping enabled (still paper mode, no live trading).
+* **Orderflow microstructure features:** The screener now injects order-book metrics (bid/ask imbalance, spread (bps), microprice deviation) into each instrument when `feeds.orderflow.enabled=true`. This enriches universe selection with real-time liquidity signals.
+* **Combinatorial Purged CV (CPCV):** In addition to standard purged K-fold cross-validation, you can enable CPCV (set `discovery.cv_method: "cpcv"`) to evaluate strategies across multiple train/test fold combinations for more robust fitness estimates.
+* **Deflated Sharpe & PBO checks:** A Deflated Sharpe Ratio gate can now filter out promoted strategies lacking statistical significance (`validation.dsr.enabled=true` with a `min_prob` confidence threshold). The system also logs the Probability of Backtest Overfitting (PBO) each cycle, based on in/out-of-sample rank correlation of strategy performance. Higher PBO indicates greater overfitting risk.
+* **Candle hygiene:** The Lakehouse data loader drops the latest OHLCV bar if it’s still in an open interval, preventing partial-bar lookahead. This check parses the timeframe (e.g. 1m, 1h) and omits any not-yet-closed candle from model data.
+
+## 🌐 Data & Universe
+
+**Orderflow Features:** When order flow feeds are enabled, the UniverseScreener enriches each instrument with real-time order book snapshots. It computes top-level imbalance, spread (in basis points), and microprice deviation via `OrderflowSnap` and attaches these as `of_imbalance`, `of_spread_bps`, `of_microprice_dev` fields. This provides the strategy generator with microstructure context (e.g. if an asset’s order book is skewed or wide) during universe selection. These features are optional and controlled by `feeds.orderflow.enabled` in the config.
+
+**Candle Hygiene:** The Lakehouse ensures data integrity by enforcing candle completeness. In `Lakehouse.get_data()`, the final bar is dropped if its timestamp falls within the current active interval (i.e. not fully closed). The timeframe string (minutes, hours, etc.) is parsed dynamically to determine the expected bar duration, so whether using 1m or 4h bars, any partial candle (for example, a 4h candle that hasn’t finished) is excluded from the dataset. This prevents any inadvertent lookahead bias from including a bar that is still forming.
+
+## 🛡️ Validation & Robustness
+
+**Purged & Combinatorial CV:** Strategy validation uses Purged K-Fold cross-validation to get an unbiased estimate of out-of-sample performance. Now, users can opt for **Combinatorial Purged CV** (`discovery.cv_method: "cpcv"`) to further stress-test strategies. CPCV runs multiple overlapping fold combinations (e.g. testing two folds at a time) to simulate more rigorous train/test splits. This helps ensure a discovered edge isn’t an artifact of one lucky split.
+
+**Deflated Sharpe Ratio Gate:** To reduce false discoveries from many trials, the promotion logic can enforce a Deflated Sharpe Ratio threshold. When enabled (`validation.dsr.enabled=true`), each candidate’s out-of-sample Sharpe significance is adjusted for the number of strategies evaluated. Candidates that don’t meet the minimum confidence (`min_prob`) that their Sharpe is real (not luck) will be rejected before promotion. This adds a secondary safeguard atop the BH-FDR control, further lowering the chance of overfit strategies entering the portfolio.
+
+**PBO Logging:** The system now computes the **Probability of Backtest Overfitting (PBO)** for each batch of strategies and logs it in the strategy promotion loop. It does so by measuring the rank correlation between in-sample and out-of-sample strategy performance across random splits of the panel (e.g. splitting the set of symbols into design vs. test sets). A negative rank correlation in a split means strategies that ranked high in-sample ranked poorly out-of-sample – a sign of overfitting. PBO is reported as the fraction of such adverse splits, giving a sense of how likely the entire batch’s results are due to overfitting. Lower PBO (near 0%) is desirable, indicating robust performance that generalizes, while higher PBO approaching 100% flags that many strategies might not hold up out-of-sample.
 
 ---
 
@@ -154,5 +167,40 @@ Covers:
 
 ✅ **Ready to run, black-box autonomous quant.**  
 📈 Compounding scoreboard = $200 → $1M in 30 days.
+
+fullyautobob8.8/
+├─ .github/
+│  ├─ copilot-instructions.md
+│  └─ prompts/
+├─ .vscode/
+├─ configs/
+│  ├─ config.yaml
+│  └─ symbols.yaml
+├─ dashboard/
+│  └─ app.py
+├─ v26meme.egg-info/
+├─ v26meme/
+│  ├─ cli.py                  # main loop orchestrator
+│  ├─ core/                   # state & DSL
+│  ├─ data/                   # lakehouse, screener, registry, harvester, QA, etc.
+│  ├─ feeds/                  # cryptopanic, onchain, orderflow
+│  ├─ research/               # feature factory, generator, validation, prober
+│  ├─ labs/                   # simlab, hyper_lab (EIL), screener_replay
+│  ├─ allocation/             # portfolio optimizer, lane budgets
+│  ├─ execution/              # exchange, risk, handler, micro-live
+│  ├─ llm/                    # OpenAI proposer
+│  └─ analytics/              # adaptive knobs, telemetry
+├─ tests/
+│  └─ data/
+├─ .env.example
+├─ .gitignore
+├─ README.md
+├─ data_harvester.py
+├─ install_and_launch_v475.sh
+├─ loop_err.log
+├─ pyproject.toml
+├─ pytest.ini
+└─ requirements.txt
+
 
 ---

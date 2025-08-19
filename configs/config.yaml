@@ -57,8 +57,8 @@ screener:
 
 feeds:
   cryptopanic: { enabled: false, window_hours: 6, min_score: -1.0 }
-  onchain:     { enabled: false, min_notional_eth: 100.0 }
-  orderflow:   { enabled: false, top_levels: 5 }
+  onchain:     { enabled: true, min_notional_eth: 100.0 }
+  orderflow:   { enabled: true, top_levels: 5 }
 
 discovery:
   population_size: 160
@@ -67,6 +67,7 @@ discovery:
   cv_folds: 4
   cv_embargo_bars: 2
   fdr_alpha: 0.10
+  cv_method: "kfold"        # Cross-validation method ("kfold" default, or "cpcv" for combinatorial purged CV)
   max_promotions_per_cycle: 3
   max_promotions_per_day: 12     # promotion-debt guard
   promotion_criteria:
@@ -76,6 +77,17 @@ discovery:
     min_sharpe: 1.10
     min_win_rate: 0.52
   factor_correlation_max: 0.80   # factor-aware penalty cut-off
+
+prober:
+  enabled: true
+  perturbations: 64
+  delta_fraction: 0.15
+  min_robust_score: 0.55
+
+validation:
+  dsr:
+    enabled: false
+    min_prob: 0.95        # Minimum probability that a strategy's Sharpe is not luck (Deflated Sharpe Ratio gate)
 
 lanes:
   core:     { base_fraction: 0.95, min_fraction: 0.85, max_fraction: 0.99 }
@@ -119,18 +131,6 @@ eil:
   max_parallel_jobs: 8
   max_queue: 5000
   survivor_top_k: 25
-
-prober:
-  enabled: true
-  perturbations: 64
-  delta_fraction: 0.15
-  min_robust_score: 0.55
-
-micro_live:
-  enabled: false
-  notional_usd: 3.00
-  cycle_budget_trades: 5
-  venues: ["coinbase", "kraken"]
 
 adaptive:
   enabled: true
