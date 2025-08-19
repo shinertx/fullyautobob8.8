@@ -28,6 +28,21 @@ class Lakehouse:
         if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df = df.set_index("timestamp")
+        # PIT safety: drop possibly open last bar
+        if len(df) > 1:
+            tf = timeframe.lower()
+            dur_s = 0
+            if tf.endswith('m') and tf[:-1].isdigit():
+                dur_s = int(tf[:-1]) * 60
+            elif tf.endswith('h') and tf[:-1].isdigit():
+                dur_s = int(tf[:-1]) * 3600
+            elif tf.endswith('d') and tf[:-1].isdigit():
+                dur_s = int(tf[:-1]) * 86400
+            if dur_s > 0:
+                import time as _t
+                last_ts = int(df.index[-1].timestamp())
+                if int(_t.time()) - last_ts < dur_s:
+                    df = df.iloc[:-1]
         return df
 
     def get_available_symbols(self, timeframe: str) -> list:

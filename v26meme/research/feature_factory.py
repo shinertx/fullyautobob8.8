@@ -23,14 +23,15 @@ class FeatureFactory:
         # Core features (PIT-safe)
         out['return_1p'] = out['close'].pct_change()
         out['volatility_20p'] = out['return_1p'].rolling(20).std() * np.sqrt(20)
-        out['momentum_10p'] = out['close'].pct_change(10)
+        out['momentum_10p'] = out['close'].pct_change(10).shift(1)
         delta = out['close'].astype(float).diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / (loss.replace(0, np.nan))
         out['rsi_14'] = 100 - (100 / (1 + rs))
+        out['rsi_14'] = out['rsi_14'].shift(1)
         out['sma_50'] = out['close'].rolling(50).mean()
-        out['close_vs_sma50'] = (out['close'] - out['sma_50']) / out['sma_50']
+        out['close_vs_sma50'] = ((out['close'] - out['sma_50']) / out['sma_50']).shift(1)
 
         # Time-of-day (PIT)
         ts = pd.to_datetime(out['timestamp'], utc=True)
@@ -53,6 +54,14 @@ class FeatureFactory:
                 eth_close = eth['close'].reindex(ts, method='pad')
                 btc_close = btc['close'].reindex(ts, method='pad')
                 out['eth_btc_ratio'] = (eth_close / btc_close).shift(1)
+
+        # Strict PIT: shift price-derived features so trading at bar t uses info up to t-1
+        shift_cols = [
+            'return_1p','volatility_20p','momentum_10p','rsi_14','sma_50','close_vs_sma50','round_proximity'
+        ]
+        for c in shift_cols:
+            if c in out.columns:
+                out[c] = out[c].shift(1)
 
         out = out.dropna()
         out = out.set_index('timestamp')

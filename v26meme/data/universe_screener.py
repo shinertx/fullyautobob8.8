@@ -11,86 +11,47 @@ def _spread_bps(t: dict) -> float:
     mid = 0.5 * (bid + ask)
     return 10000.0 * (ask - bid) / mid if mid > 0 else float('inf')
 
-def _impact_bps(ex, market_id: str, notional_usd: float, usd_per_quote: float) -> float:
+def _impact_bps(ex, venue_symbol: str, notional_usd: float, usd_per_quote: float) -> float:
+    """Estimate impact (bps) for a market order using venue symbol (CCXT format)."""
     try:
-        ob = ex.fetch_order_book(market_id, limit=50) # Deeper book for better accuracy
-        if not ob or not isinstance(ob, dict):
-            logger.warning(f"Impact calc for {market_id}: Order book is missing or not a dict.")
+        ob = ex.fetch_order_book(venue_symbol, limit=50)
+        bids = ob.get('bids', []) if isinstance(ob, dict) else []
+        asks = ob.get('asks', []) if isinstance(ob, dict) else []
+        if not bids or not asks:
             return float('inf')
-
-        asks, bids = ob.get('asks') or [], ob.get('bids') or []
-        
-        if not asks or not bids:
-            logger.warning(f"Impact calc for {market_id}: no asks or bids. Asks: {len(asks)}, Bids: {len(bids)}")
-            return float('inf')
-        
-        # This is the amount of QUOTE currency we need to spend.
-        # For a $10 trade in BTC/USD, need_quote is 10 USD.
+        # required quote notional in quote currency units
         need_quote = notional_usd / max(1e-12, usd_per_quote)
-        
         filled_quote = 0.0
         filled_base = 0.0
-
-        for i, entry in enumerate(asks):
-            if not entry or len(entry) < 2:
-                logger.warning(f"Impact calc for {market_id}: invalid ask entry at index {i}: {entry}")
-                continue
+        for price, size, *rest in asks:
             try:
-                price, size, *_ = entry
-                price, size = float(price), float(size)
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Impact calc for {market_id}: could not parse price/size from ask entry {entry}. Error: {e}")
+                price = float(price); size = float(size)
+            except Exception:
                 continue
-
-            # How much we can spend at this level
-            cost_of_level = price * size
-            
-            # How much we still need to spend
-            quote_remaining = need_quote - filled_quote
-
-            # Spend the minimum of what's available and what we still need
-            quote_to_spend = min(cost_of_level, quote_remaining)
-            
-            base_to_get = quote_to_spend / price
-
-            filled_quote += quote_to_spend
-            filled_base += base_to_get
-
-            if filled_quote >= need_quote:
+            cost = price * size
+            remain = need_quote - filled_quote
+            take = min(cost, remain)
+            if take <= 0:
                 break
-
-        if filled_quote < (need_quote * 0.999): # Allow for small floating point inaccuracies
-            logger.warning(f"Impact calc for {market_id}: could not fill order. Needed {need_quote} USD, filled {filled_quote} USD.")
+            filled_quote += take
+            filled_base += take / max(1e-12, price)
+            if filled_quote >= need_quote * 0.999:
+                break
+        if filled_quote < need_quote * 0.999 or filled_base <= 0:
             return float('inf')
-
-        # The actual VWAP is the total quote spent divided by the total base acquired.
-        vwap = filled_quote / filled_base if filled_base > 0 else 0
-        if vwap == 0:
-            logger.warning(f"Impact calc for {market_id}: VWAP is zero.")
+        best_bid = float(bids[0][0]) if bids and bids[0] else 0.0
+        best_ask = float(asks[0][0]) if asks and asks[0] else 0.0
+        if best_bid <= 0 or best_ask <= 0:
             return float('inf')
-
-        if not bids[0] or len(bids[0]) < 1 or not asks[0] or len(asks[0]) < 1:
-             logger.warning(f"Impact calc for {market_id}: Missing best bid/ask price.")
-             return float('inf')
-
-        try:
-            best_bid_price, *_ = bids[0]
-            best_ask_price, *_ = asks[0]
-            best_bid, best_ask = float(best_bid_price), float(best_ask_price)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Impact calc for {market_id}: could not parse best bid/ask. Error: {e}")
-            return float('inf')
-
-        # Sanity check: if VWAP is wildly different from best ask, something is wrong.
-        if best_ask > 0 and vwap > best_ask * 1.25:
-            logger.warning(f"Impact calc for {market_id}: VWAP {vwap} is >25% higher than best ask {best_ask}. Invalidating.")
-            return float('inf')
-
         mid = 0.5 * (best_bid + best_ask)
-
-        return 10000.0 * (vwap - mid) / mid if mid > 0 else float('inf')
+        vwap = filled_quote / max(1e-12, filled_base)
+        if mid <= 0:
+            return float('inf')
+        if best_ask > 0 and vwap > best_ask * 1.25:
+            return float('inf')
+        return 10000.0 * (vwap - mid) / mid
     except Exception:
-        logger.opt(exception=True).warning(f"Impact calc failed unexpectedly for {market_id}")
+        logger.opt(exception=True).warning(f"Impact calc failed unexpectedly for {venue_symbol}")
         return float('inf')
 
 class UniverseScreener:
@@ -108,6 +69,7 @@ class UniverseScreener:
         of_cfg = self.feeds.get('orderflow', {})
         self.orderflow_enabled = bool(of_cfg.get('enabled', False))
         self.orderflow_top = int(of_cfg.get('top_levels', 5))
+        self.allowed_quotes = ("USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD")
 
     def get_active_universe(self) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, dict]]]:
         logger.info(f"[screener] SENTINEL enter get_active_universe spread_cap={self.cfg.get('max_spread_bps')} impact_cap={self.cfg.get('max_impact_bps')} order_usd={self.cfg.get('typical_order_usd')} volume_min={self.cfg.get('min_24h_volume_usd')}")
@@ -139,8 +101,12 @@ class UniverseScreener:
                 try: price = float(last)
                 except Exception: continue
 
+                # Early quote + price filters
                 quote = m.get("quote")
-                if quote not in ("USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD"): continue
+                if quote not in self.allowed_quotes:
+                    continue
+                if price < float(self.cfg.get('min_price', 0.0)):
+                    continue
                 rate = 1.0 if quote == "USD" else fx.to_usd(quote)
                 if rate is None: continue
 
@@ -171,7 +137,11 @@ class UniverseScreener:
                 base, quote = m.get("base"), m.get("quote")
                 canonical = make_canonical(base, quote, kind="SPOT")
                 inst = {
-                    "venue": venue, "type": "spot", "market_id": m.get("symbol",""),
+                    "venue": venue, "type": "spot",
+                    # canonical id for downstream joins
+                    "market_id": canonical,
+                    # preserve raw venue symbol for API calls (order book / trades)
+                    "venue_symbol": m.get("symbol",""),
                     "base": base, "quote": quote, "display": canonical,
                     "precision": m.get("precision", {}), "limits": m.get("limits", {}),
                     "spread_bps": spr, "price": price, "volume_24h_usd": vol_usd,
@@ -195,7 +165,7 @@ class UniverseScreener:
         for (inst, vol) in short:
             ex = self.exchanges[inst['venue']]
             try:
-                imp = _impact_bps(ex, inst['market_id'], self.cfg['typical_order_usd'], inst.get('usd_per_quote', 1.0))
+                imp = _impact_bps(ex, inst['venue_symbol'], self.cfg['typical_order_usd'], inst.get('usd_per_quote', 1.0))
                 impact_attempts += 1
                 if imp == float('inf'):
                     impact_inf += 1
@@ -230,7 +200,8 @@ class UniverseScreener:
 
         # Attach canonical display name and optional orderflow features
         for inst in final_selection:
-            inst['display'] = f"{inst['base'].upper()}_{inst['quote'].upper()}_SPOT"
+            # Ensure display remains canonical
+            inst['display'] = make_canonical(inst['base'], inst['quote'], kind="SPOT")
         if self.orderflow_enabled and final_selection:
             try:
                 from v26meme.feeds.orderflow import OrderflowSnap

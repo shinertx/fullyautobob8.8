@@ -106,9 +106,14 @@ cd v26meme
 
 ## 🔄 Recent Enhancements
 
+* **Deflated Sharpe Gate (2025-08-19):** Activated probabilistic overfit filter (`validation.dsr.enabled=true`, `min_prob=0.60`). Strategies must clear deflated Sharpe confidence threshold after BH-FDR.
+* **On-Demand Harvest Queue:** `eil:harvest:requests` now drained each cycle; queued canonicals are force-included in the harvester plan (all configured timeframes) for next ingestion.
+* **Screener Canonical Alignment:** Screener now sets `market_id` to canonical (e.g. `BTC_USD_SPOT`) and preserves raw venue symbol as `venue_symbol` for impact calculation and API calls; ensures downstream joins are consistent with Lakehouse.
+* **Basic Alpha Pruning:** Automatic removal of stale alphas (>=30 trades & Sharpe < 0) controlled by `discovery.enable_pruning`.
+* **Promotion Buffer Knob:** `promotion_buffer_multiplier` allows optional tightening (defaults 1.0 — neutral).
+* **Expanded Core Universe (2025-08-19):** Added high-liquidity USD spot pairs (LTC, LDO, BCH, UNI, ATOM, FIL, NEAR, ARB, OP, INJ, APT, XLM, ALGO, SUI, SHIB) to `harvester.core_symbols`.
 * **Orderflow microstructure features:** The screener now injects order-book metrics (bid/ask imbalance, spread (bps), microprice deviation) into each instrument when `feeds.orderflow.enabled=true`. This enriches universe selection with real-time liquidity signals.
 * **Combinatorial Purged CV (CPCV):** In addition to standard purged K-fold cross-validation, you can enable CPCV (set `discovery.cv_method: "cpcv"`) to evaluate strategies across multiple train/test fold combinations for more robust fitness estimates.
-* **Deflated Sharpe & PBO checks:** A Deflated Sharpe Ratio gate can now filter out promoted strategies lacking statistical significance (`validation.dsr.enabled=true` with a `min_prob` confidence threshold). The system also logs the Probability of Backtest Overfitting (PBO) each cycle, based on in/out-of-sample rank correlation of strategy performance. Higher PBO indicates greater overfitting risk.
 * **Candle hygiene:** The Lakehouse data loader drops the latest OHLCV bar if it’s still in an open interval, preventing partial-bar lookahead. This check parses the timeframe (e.g. 1m, 1h) and omits any not-yet-closed candle from model data.
 
 ## 🌐 Data & Universe

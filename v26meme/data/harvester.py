@@ -5,7 +5,7 @@ from loguru import logger
 import pandas as pd
 from datetime import datetime, timezone
 import json, ast, math
-from typing import List, Dict, Any, Iterable
+from typing import List, Dict, Any, Iterable, Set
 
 from v26meme.core.state import StateManager
 from v26meme.data.checkpoints import Checkpoints
@@ -186,10 +186,53 @@ def _repair_gaps(exchange, market: str, tf: str, tf_ms: int, df: pd.DataFrame, b
         attempts += 1
     return added
 
+def _drain_eil_queue(state: StateManager, limit: int = 200) -> set[str]:
+    """Drain on-demand harvest canonical requests from Redis queue.
+
+    PIT: consumes only previously enqueued canonicals. Limit applied defensively.
+    """
+    canonicals: set[str] = set()
+    try:
+        raw_items = state.r.lrange("eil:harvest:requests", 0, -1) or []
+        if isinstance(raw_items, (list, tuple)):
+            raw_items = raw_items[:limit]
+        else:
+            raw_items = []
+        for raw in raw_items:
+            try:
+                d = _safe_parse_eil(raw)
+                if not d:
+                    continue
+                c = d.get("canonical")
+                if isinstance(c, str) and c:
+                    canonicals.add(c)
+            except Exception as e:  # continue on parse errors
+                logger.debug(f"Failed to parse queue entry: {e}")
+                continue
+        if raw_items:
+            state.r.delete("eil:harvest:requests")
+        if canonicals:
+            logger.info(f"Drained {len(canonicals)} canonicals from eil:harvest:requests")
+    except Exception:
+        pass
+    return canonicals
+
+def _enrich_plan_with_queue(plan: Dict[str, set[str]], state: StateManager) -> Dict[str, set[str]]:
+    """Add any queued on-demand canonicals into every timeframe's plan."""
+    queued = _drain_eil_queue(state)
+    if queued:
+        for tf in list(plan.keys()):
+            plan[tf] = plan[tf].union(queued)
+        logger.info(f"Added {len(queued)} queued canonicals to harvest plan")
+    return plan
+
 def run_once(cfg, state: StateManager):
+    logger.info("[harvest] run_once invoked (event-sourced cycle start)")
     base_dir = Path("./data")
     quotas = cfg["harvester"].get("quotas", {})
     plan = _build_plan(cfg, state)
+    # Queue enrichment (on-demand requests)
+    plan = _enrich_plan_with_queue(plan, state)
     ckp = Checkpoints(state)
 
     max_gap_pct_accept = float(cfg["harvester"].get("max_gap_pct_accept", 0.10))  # 10% default
