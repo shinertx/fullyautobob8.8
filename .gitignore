@@ -1,15 +1,49 @@
-.venv/
+# Virtualenv
+.venv
+.venv-*
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Logs and databases
+*.log
+*.db
+*.sqlite3
+inspector_output.log
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python cache
 __pycache__/
 *.pyc
-logs/
-data/
-.env
-.streamlit/
-loop_err.log
-v26meme.egg-info/
-.dist/
-.coverage
-htmlcov/
 .mypy_cache/
 pytest-cache/
-.DS_Store
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Distribution files
+v26meme.egg-info/
+.dist/
+
+# Streamlit files
+.streamlit/
+
+# Data files
+/data/
+
+# Logs
+logs/
+
+# Misc
+loop_err.log

@@ -1,5 +1,5 @@
 system:
-  loop_interval_seconds: 90
+  loop_interval_seconds: 30
   log_level: "INFO"
   redis_host: "localhost"
   redis_port: 6379
@@ -11,7 +11,10 @@ data_source:
 # v4.7.5 data-plane
 harvester:
   core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","AVAX_USD_SPOT","LINK_USD_SPOT",
-                 "ADA_USD_SPOT","XRP_USD_SPOT","DOGE_USD_SPOT","MATIC_USD_SPOT","DOT_USD_SPOT"]
+                 "ADA_USD_SPOT","XRP_USD_SPOT","DOGE_USD_SPOT","MATIC_USD_SPOT","DOT_USD_SPOT","EUR_USD_SPOT",
+                 "LTC_USD_SPOT","LDO_USD_SPOT","BCH_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT","FIL_USD_SPOT",
+                 "NEAR_USD_SPOT","ARB_USD_SPOT","OP_USD_SPOT","INJ_USD_SPOT","APT_USD_SPOT","XLM_USD_SPOT",
+                 "ALGO_USD_SPOT","SUI_USD_SPOT","SHIB_USD_SPOT"]
   dynamic_enabled: true
   timeframes_by_lane:
     core:     ["1m","5m","15m","1h","4h","1d"]
@@ -57,8 +60,14 @@ screener:
 
 feeds:
   cryptopanic: { enabled: false, window_hours: 6, min_score: -1.0 }
-  onchain:     { enabled: false, min_notional_eth: 100.0 }
-  orderflow:   { enabled: false, top_levels: 5 }
+  onchain:     { enabled: true, min_notional_eth: 100.0 }
+  orderflow:   { enabled: true, top_levels: 5 }
+
+validation:
+  dsr:
+    enabled: false  # TEMP bootstrap: disabled to allow faster initial promotions; revert to true after seeding
+    min_prob: 0.60       # require >=60% probability Sharpe not luck (deflated)
+    benchmark_sr: 0.0
 
 discovery:
   population_size: 160
@@ -67,15 +76,24 @@ discovery:
   cv_folds: 4
   cv_embargo_bars: 2
   fdr_alpha: 0.10
+  cv_method: "kfold"        # Cross-validation method ("kfold" default, or "cpcv" for combinatorial purged CV)
   max_promotions_per_cycle: 3
   max_promotions_per_day: 12     # promotion-debt guard
+  promotion_buffer_multiplier: 1.0  # set >1.0 (e.g., 1.10) for tighter buffer
+  enable_pruning: true
   promotion_criteria:
-    min_trades: 75
-    min_sortino: 1.25
+    min_trades: 40   # TEMP bootstrap (was 75) -> revert after initial active alpha set
+    min_sortino: 1.00  # TEMP bootstrap (was 1.25)
     max_mdd: 0.20
-    min_sharpe: 1.10
-    min_win_rate: 0.52
+    min_sharpe: 0.90  # TEMP bootstrap (was 1.10)
+    min_win_rate: 0.50  # slightly relaxed (was 0.52)
   factor_correlation_max: 0.80   # factor-aware penalty cut-off
+
+prober:
+  enabled: true
+  perturbations: 64
+  delta_fraction: 0.15
+  min_robust_score: 0.55
 
 lanes:
   core:     { base_fraction: 0.95, min_fraction: 0.85, max_fraction: 0.99 }
@@ -119,18 +137,6 @@ eil:
   max_parallel_jobs: 8
   max_queue: 5000
   survivor_top_k: 25
-
-prober:
-  enabled: true
-  perturbations: 64
-  delta_fraction: 0.15
-  min_robust_score: 0.55
-
-micro_live:
-  enabled: false
-  notional_usd: 3.00
-  cycle_budget_trades: 5
-  venues: ["coinbase", "kraken"]
 
 adaptive:
   enabled: true

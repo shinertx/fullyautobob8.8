@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple
 from scipy.stats import ttest_1samp
+from math import sqrt, log
 
 def purged_kfold_indices(n: int, k: int, embargo: int) -> List[Tuple[np.ndarray, np.ndarray]]:
     """Generate purged K-fold indices with embargo.
@@ -39,7 +40,7 @@ def benjamini_hochberg(pvals: List[float], alpha: float):
             thresh = max(thresh, pvals[idx])
     return accept, thresh
 
-def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: int, alpha_fdr: float):
+def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: int, alpha_fdr: float, cv_method: str = "kfold"):
     """Aggregate panel cross-validation statistics with purged K-fold and FDR gate helper.
 
     PIT: Operates strictly on historical returns; ensures variance guard.
@@ -50,7 +51,25 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: i
         if s.empty or len(s) < max(20, k_folds*5): continue
         n = len(s)
         folds = purged_kfold_indices(n, k_folds, embargo)
-        oos_chunks = [s.iloc[test_idx] for _, test_idx in folds]
+        if cv_method and str(cv_method).lower() == "cpcv" and k_folds > 1:
+            # Combinatorial Purged CV: generate combinations of test folds (e.g. pairs) as additional OOS scenarios
+            comb_folds = []
+            for i in range(k_folds):
+                for j in range(i+1, k_folds):
+                    test_idx = np.concatenate([folds[i][1], folds[j][1]])
+                    test_idx = np.unique(test_idx)
+                    test_idx.sort()
+                    train_mask = np.ones(n, dtype=bool)
+                    emb_lo_i = max(0, folds[i][1][0] - embargo); emb_hi_i = min(n, folds[i][1][-1] + 1 + embargo)
+                    train_mask[emb_lo_i:emb_hi_i] = False
+                    emb_lo_j = max(0, folds[j][1][0] - embargo); emb_hi_j = min(n, folds[j][1][-1] + 1 + embargo)
+                    train_mask[emb_lo_j:emb_hi_j] = False
+                    train_mask[test_idx] = False
+                    comb_folds.append((np.where(train_mask)[0], test_idx))
+            folds_to_use = comb_folds
+        else:
+            folds_to_use = folds
+        oos_chunks = [s.iloc[test_idx] for _, test_idx in folds_to_use]
         if oos_chunks: all_oos.append(pd.concat(oos_chunks))
     if not all_oos:
         return {"p_value": 1.0, "mean_oos": 0.0, "n": 0}
@@ -69,3 +88,21 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series], k_folds: int, embargo: i
             p = 1.0
     mean_val = float(all_oos_concat.mean()) if len(all_oos_concat) else 0.0
     return {"p_value": p, "mean_oos": mean_val, "n": int(all_oos_concat.shape[0])}
+
+def deflated_sharpe_ratio(returns: pd.Series, n_trials: int, sr_benchmark: float = 0.0) -> float:
+    """Approximate Deflated Sharpe Ratio probability (Bailey & Lopez de Prado).
+
+    PIT: Uses only historical returns array; n_trials reflects selection breadth.
+    Returns probability Sharpe > benchmark after deflation for multiple testing.
+    """
+    r = returns.dropna()
+    if r.empty or r.std(ddof=1) == 0:
+        return 0.0
+    sr_hat = float(r.mean() / r.std(ddof=1))
+    n = len(r)
+    infl = sqrt(max(0.0, 2.0 * log(max(2, n_trials)))) / sqrt(max(1, n - 1))
+    sr_star = sr_benchmark + infl
+    z = (sr_hat - sr_star) * sqrt(max(1, n - 1))
+    from math import erf
+    phi = 0.5 * (1.0 + erf(z / sqrt(2.0)))
+    return max(0.0, min(1.0, float(phi)))

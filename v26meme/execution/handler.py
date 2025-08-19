@@ -66,8 +66,17 @@ class ExecutionHandler:
             if not sym: continue
             symbol_target[sym] = symbol_target.get(sym, 0.0) + float(w)
 
-        price_cache = {}
         equity_mark = cash
+        price_cache = {}
+
+        # Early risk halt flatten
+        if self.state.get('risk:halted'):
+            logger.warning("RISK HALTED - flatten all positions now")
+            for sym in list(positions.keys()):
+                symbol_target[sym] = 0.0
+            active_alphas = []
+            target_weights = {}
+
         for sym in set(list(symbol_target.keys()) + list(positions.keys())):
             ex_sym = self._ex_symbol(sym)
             if not ex_sym:
@@ -79,7 +88,14 @@ class ExecutionHandler:
             positions[sym] = {'amount': amt, 'usd_value': amt * px}
             equity_mark += amt * px
 
-        if self.risk: symbol_target = self.risk.enforce(symbol_target, equity_mark)
+        if self.risk:
+            symbol_target = self.risk.enforce(symbol_target, equity_mark)
+            # If halted, flatten current positions to cash
+            if self.state.get('risk:halted'):
+                logger.warning("Risk halted — flattening all positions to cash.")
+                # force all held symbols to zero target to close them
+                for sym in list(positions.keys()):
+                    symbol_target[sym] = 0.0
 
         if self.cfg['mode'] == 'paper':
             for sym, w in (symbol_target or {}).items():
