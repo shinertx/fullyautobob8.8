@@ -1,0 +1,13 @@
+[project]
+name = "v26meme"
+version = "4.7.5"
+description = "v26meme v4.7.5: Event-sourced data-plane, canonical registry, QA gates, OpenAI-only LLM, calibrated sim."
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["v26meme"]

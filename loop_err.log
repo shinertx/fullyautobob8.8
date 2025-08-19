@@ -1,0 +1,24 @@
+fatal: bad revision 'HEAD'
+2025-08-18 23:58:16.553 | INFO     | __main__:loop:84 - 🚀 v26meme v4.7.5 loop starting…
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/benjaminjones/fullyautobob8.8/v26meme/cli.py", line 322, in <module>
+    cli()
+  File "/home/benjaminjones/fullyautobob8.8/.venv/lib/python3.10/site-packages/click/core.py", line 1157, in __call__
+    return self.main(*args, **kwargs)
+  File "/home/benjaminjones/fullyautobob8.8/.venv/lib/python3.10/site-packages/click/core.py", line 1078, in main
+    rv = self.invoke(ctx)
+  File "/home/benjaminjones/fullyautobob8.8/.venv/lib/python3.10/site-packages/click/core.py", line 1688, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+  File "/home/benjaminjones/fullyautobob8.8/.venv/lib/python3.10/site-packages/click/core.py", line 1434, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+  File "/home/benjaminjones/fullyautobob8.8/.venv/lib/python3.10/site-packages/click/core.py", line 783, in invoke
+    return __callback(*args, **kwargs)
+  File "/home/benjaminjones/fullyautobob8.8/v26meme/cli.py", line 89, in loop
+    _ensure_lakehouse_bootstrap(cfg)
+  File "/home/benjaminjones/fullyautobob8.8/v26meme/cli.py", line 41, in _ensure_lakehouse_bootstrap
+    from data_harvester import harvest as _harvest
+ImportError: cannot import name 'harvest' from 'data_harvester' (/home/benjaminjones/fullyautobob8.8/data_harvester.py)

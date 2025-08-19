@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+v26meme/__init__.py
+v26meme/cli.py
+v26meme.egg-info/PKG-INFO
+v26meme.egg-info/SOURCES.txt
+v26meme.egg-info/dependency_links.txt
+v26meme.egg-info/top_level.txt

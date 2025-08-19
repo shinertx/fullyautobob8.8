@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+data/
+.env
+.streamlit/
+loop_err.log
+v26meme.egg-info/
+.dist/
+.coverage
+htmlcov/
+.mypy_cache/
+pytest-cache/
+.DS_Store

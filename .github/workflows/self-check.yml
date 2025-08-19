@@ -1,0 +1,17 @@
+name: self-check
+on:
+  push:
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - run: python - <<'PY'\nimport compileall,sys; sys.exit(0 if compileall.compile_dir('.', quiet=1) else 1)\nPY
+      - run: pytest -q
+      - name: Guard secrets
+        run: |
+          ! git grep -nE "OPENAI_API_KEY|COINBASE_API_KEY|KRAKEN_API_KEY" -- . ':!*.md' || (echo 'Secret-like token in repo'; exit 1)
