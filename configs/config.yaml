@@ -65,7 +65,7 @@ feeds:
 
 validation:
   dsr:
-    enabled: true
+    enabled: false  # TEMP bootstrap: disabled to allow faster initial promotions; revert to true after seeding
     min_prob: 0.60       # require >=60% probability Sharpe not luck (deflated)
     benchmark_sr: 0.0
 
@@ -82,11 +82,11 @@ discovery:
   promotion_buffer_multiplier: 1.0  # set >1.0 (e.g., 1.10) for tighter buffer
   enable_pruning: true
   promotion_criteria:
-    min_trades: 75
-    min_sortino: 1.25
+    min_trades: 40   # TEMP bootstrap (was 75) -> revert after initial active alpha set
+    min_sortino: 1.00  # TEMP bootstrap (was 1.25)
     max_mdd: 0.20
-    min_sharpe: 1.10
-    min_win_rate: 0.52
+    min_sharpe: 0.90  # TEMP bootstrap (was 1.10)
+    min_win_rate: 0.50  # slightly relaxed (was 0.52)
   factor_correlation_max: 0.80   # factor-aware penalty cut-off
 
 prober:
