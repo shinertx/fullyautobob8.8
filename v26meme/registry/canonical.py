@@ -1,5 +1,6 @@
 from typing import Optional, Dict
 from v26meme.registry.venues import venue_symbol_map
+from v26meme.registry.resolver import get_resolver
 
 # Per-process cache: exchange.id -> {canonical -> unified symbol}
 _SYMBOL_CACHE: Dict[str, Dict[str, str]] = {}
@@ -32,25 +33,4 @@ def _build_map_for_exchange(exchange) -> Dict[str, str]:
 
 def venue_symbol_for(exchange, canonical: str) -> Optional[str]:
     base, quote, kind = parse_canonical(canonical)
-    if kind != "SPOT":
-        return None
-    exid = getattr(exchange, "id", "unknown")
-    cmap = _SYMBOL_CACHE.get(exid)
-    if cmap is None:
-        cmap = _build_map_for_exchange(exchange)
-        _SYMBOL_CACHE[exid] = cmap
-    sym = cmap.get(canonical)
-    if sym:
-        return sym
-    # Static fallback (legacy)
-    static = (venue_symbol_map.get(exid, {}) or {}).get(canonical)
-    if static:
-        return static
-    # Last chance direct symbol attempt
-    direct = f"{base}/{quote}"
-    try:
-        if direct in (getattr(exchange, "markets", {}) or {}):
-            return direct
-    except Exception:
-        pass
-    return None
+    return get_resolver().resolve(exchange, base, quote, kind, canonical_key=canonical)

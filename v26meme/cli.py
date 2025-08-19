@@ -25,6 +25,8 @@ from v26meme.execution.risk import RiskManager
 from v26meme.core.dsl import Alpha
 from v26meme.llm.proposer import LLMProposer
 from v26meme.analytics.adaptive import publish_adaptive_knobs
+from v26meme.registry.resolver import configure as configure_resolver
+from v26meme.registry.catalog import CatalogManager
 
 def load_config(file: str = "configs/config.yaml"):
     with open(file, "r") as f: return yaml.safe_load(f)
@@ -79,6 +81,7 @@ def loop():
     load_dotenv()
     cfg = load_config()
     random.seed(cfg["system"].get("seed", 1337))
+    configure_resolver(cfg.get("registry"))
 
     Path("logs").mkdir(exist_ok=True, parents=True)
     logger.add("logs/system.log", level=cfg["system"]["log_level"], rotation="10 MB",
@@ -95,6 +98,7 @@ def loop():
     screener = UniverseScreener(cfg["data_source"]["exchanges"], cfg["screener"], cfg.get("feeds"))
     store = ScreenerStore(cfg["screener"].get("snapshot_dir", "data/screener_snapshots"), state)
     feature_factory = FeatureFactory()
+    catalog = CatalogManager(state, cfg.get("registry"))
 
     slip_table = state.get("slippage:table") or {}
     try:
@@ -125,6 +129,7 @@ def loop():
         try:
             state.heartbeat()
             logger.info("--- New loop cycle ---")
+            catalog.maybe_refresh(screener.exchanges, include_derivatives=cfg["screener"].get("derivatives_enabled", False))
 
             instruments, tickers_by_venue = screener.get_active_universe()
             if not instruments:

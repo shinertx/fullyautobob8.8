@@ -34,6 +34,14 @@ harvester:
     "1h": 1825
     "4h": 1825
     "1d": 3650
+  max_gap_pct_accept: 0.50  # will tighten after staged backfill completes
+  bootstrap_days_override: {"1m": 1, "5m": 3}
+  staged_backfill:
+    enabled: true
+    targets_days:
+      "1m": [1, 3, 7]
+      "5m": [3, 14, 30]
+      "15m": [7, 30, 90]
 
 screener:
   snapshot_dir: "data/screener_snapshots"
@@ -133,3 +141,17 @@ adaptive:
   screener_max_markets_max: 36
   population_size_min: 120
   population_size_max: 240
+
+registry:
+  allowed_quotes_global: ["USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD","EUR","GBP"]
+  allowed_quotes_by_venue:
+    kraken: ["USD","USDT","USDC","EUR"]
+    coinbase: ["USD","USDC"]
+  base_aliases:
+    BTC: ["XBT"]
+    IOTA: ["MIOTA"]
+  cache_ttl_s: 600
+  catalog_refresh_seconds: 900
+  timeframe_aliases_by_venue:
+    coinbase:
+      "4h": "6h"
