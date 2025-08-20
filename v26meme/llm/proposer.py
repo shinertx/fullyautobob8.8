@@ -1,13 +1,13 @@
-import os, json, random
+import os, json, random, time, hashlib
 from typing import List, Dict, Any
 import requests
 from loguru import logger
 
 class LLMProposer:
-    """
-    OpenAI-only. If OPENAI_API_KEY missing, returns [].
-    JSON-hardened: expects a JSON list of formulas where each formula is either
-      [cond, 'AND'|'OR', cond] or [feature, '>'|'<' , threshold]
+    """OpenAI-only proposer with hardened JSON pipeline.
+
+    PIT: Deterministic post-processing; no future leakage.
+    Guardrails: feature whitelist, threshold clamps, dedupe, metrics.
     """
     def __init__(self, state):
         self.state = state
@@ -17,46 +17,108 @@ class LLMProposer:
         # disabled by policy; return []
         return []
 
-    def _remote_suggestions(self, base_features: List[str], k: int = 3) -> List[List[Any]]:
+    def _remote_suggestions(self, base_features: List[str], k: int = 3, threshold_min: float = -5.0, threshold_max: float = 5.0) -> List[List[Any]]:
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key or self.provider != "openai" or k<=0:
             return []
-        sys_prompt = "Generate boolean trading rules using only the given feature names. Return STRICT JSON."
-        user = {
-            "features": base_features,
-            "k": k,
-            "format": "Return a JSON list of formulas where each formula is either [cond, 'AND'|'OR', cond] or [feature, '>'|'<' , threshold]."
-        }
+        whitelist = sorted(set(base_features))
+        sys_prompt = (
+            "You generate ONLY raw JSON (no prose). Return a JSON list of boolean formulas. "
+            "Grammar: A condition is [feature, '>'|'<' , number]. A formula is either a condition or [formula,'AND'|'OR',formula]. "
+            "Constraints: use ONLY these features: " + ",".join(whitelist) + ". "
+            "Numbers should be within [-5,5]. Do not explain."
+        )
+        user = {"k": k, "features": whitelist}
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {"model":"gpt-4o-mini","messages":[{"role":"system","content":sys_prompt},{"role":"user","content":json.dumps(user)}],
-                   "temperature": 0.7}
+                   "temperature": 0.4, "max_tokens": 400}
+        t0 = time.monotonic()
         try:
-            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=20)
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=15)
+            latency_ms = int((time.monotonic()-t0)*1000)
+            if getattr(self.state,'r',None):
+                self.state.r.hincrby("llm:proposer:latency_ms_buckets", str(min( (latency_ms//100)*100, 2000)), 1)
             r.raise_for_status()
             j = r.json()
             txt = (j.get("choices") or [{}])[0].get("message", {}).get("content", "[]")
-            start = txt.find("["); end = txt.rfind("]")
+            # Strip fences / whitespace
+            txt = txt.strip().strip('`')
+            # Locate outermost JSON list
+            start = txt.find('['); end = txt.rfind(']')
             if start == -1 or end == -1:
+                if getattr(self.state,'r',None): self.state.r.incr("llm:proposer:rejected")
                 return []
-            suggestions = json.loads(txt[start:end+1])
-            cleaned = []
+            raw_slice = txt[start:end+1]
+            try:
+                suggestions = json.loads(raw_slice)
+            except Exception:
+                if getattr(self.state,'r',None): self.state.r.incr("llm:proposer:rejected")
+                return []
+            cleaned: List[List[Any]] = []
+            seen_hashes = set()
+            pipe = getattr(self.state,'r',None)
+            existing = set(pipe.smembers('llm:proposer:seen')) if pipe else set()
+
+            def _valid(node) -> bool:
+                if not isinstance(node, list) or len(node) < 3:
+                    return False
+                # condition
+                if isinstance(node[0], str) and node[1] in ('>','<'):
+                    if node[0] not in whitelist: return False
+                    try:
+                        v = float(node[2]);
+                    except Exception:
+                        return False
+                    return True
+                # composite
+                if isinstance(node[0], list) and isinstance(node[2], list) and node[1] in ('AND','OR'):
+                    return _valid(node[0]) and _valid(node[2])
+                return False
+
+            def _clamp(node):
+                if isinstance(node, list) and len(node)>=3 and isinstance(node[0], str) and node[1] in ('>','<'):
+                    try:
+                        val = float(node[2])
+                        node[2] = max(threshold_min, min(threshold_max, val))
+                    except Exception:
+                        node[2] = 0.0
+                elif isinstance(node, list) and len(node)>=3:
+                    if isinstance(node[0], list): _clamp(node[0])
+                    if isinstance(node[2], list): _clamp(node[2])
+
             for f in suggestions:
-                if isinstance(f, list) and len(f)>=3:
-                    if isinstance(f[0], list) or (isinstance(f[0], str) and f[1] in (">","<")):
-                        cleaned.append(f)
-            self.state.r.incr("llm:proposer:success") if getattr(self.state,'r',None) else None
+                if not _valid(f):
+                    continue
+                _clamp(f)
+                canon = json.dumps(f, separators=(',',':'))
+                h = hashlib.sha256(canon.encode()).hexdigest()
+                if h in existing or h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                cleaned.append(f)
+            if pipe:
+                if cleaned:
+                    pipe.incr("llm:proposer:success")
+                    for f in cleaned:
+                        pipe.rpush("llm:proposals", json.dumps(f, separators=(',',':')))
+                    # add hashes to SET (trim if >5k)
+                    if seen_hashes:
+                        pipe.sadd('llm:proposer:seen', *list(seen_hashes))
+                rejected = len(suggestions) - len(cleaned)
+                if rejected>0: pipe.incrby("llm:proposer:rejected", rejected)
+                pipe.hincrby("llm:proposer:char_usage", "total_chars", len(txt))
+                pipe.execute()
             return cleaned[:k]
         except requests.HTTPError as he:
-            code = he.response.status_code if he.response else 'NA'
-            logger.warning(f"LLM proposer HTTP {code}")
             if getattr(self.state,'r',None):
                 self.state.r.incr("llm:proposer:http_errors")
+            logger.warning(f"LLM proposer HTTP {getattr(he.response,'status_code', 'NA')}")
             return []
         except Exception as e:
-            logger.warning(f"LLM proposer error: {type(e).__name__}")
             if getattr(self.state,'r',None):
                 self.state.r.incr("llm:proposer:errors")
+            logger.warning(f"LLM proposer error: {type(e).__name__}")
             return []
 
-    def propose(self, base_features: List[str], k: int = 3) -> List[List[Any]]:
-        return self._remote_suggestions(base_features, k=k)
+    def propose(self, base_features: List[str], k: int = 3, threshold_min: float=-5.0, threshold_max: float=5.0) -> List[List[Any]]:
+        return self._remote_suggestions(base_features, k=k, threshold_min=threshold_min, threshold_max=threshold_max)

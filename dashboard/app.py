@@ -28,9 +28,14 @@ if not r:
     st.stop()
 
 def get_state(key: str) -> Optional[Any]:
-    """Fetch and decode Redis state key"""
+    """Fetch and decode Redis state key safely"""
     val = r.get(key)
-    return json.loads(val) if val else None
+    if not val:
+        return None
+    try:
+        return json.loads(val)
+    except json.JSONDecodeError:
+        return None
 
 def equity_curve() -> List[Dict[str, Any]]:
     """Fetch equity curve from sorted set"""

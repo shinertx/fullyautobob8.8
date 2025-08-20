@@ -21,7 +21,7 @@ class FeatureFactory:
         out = out.sort_values("timestamp").reset_index(drop=True)
 
         # Core features (PIT-safe)
-        out['return_1p'] = out['close'].pct_change()
+        out['return_1p'] = out['close'].pct_change().shift(1)
         out['volatility_20p'] = out['return_1p'].rolling(20).std() * np.sqrt(20)
         out['momentum_10p'] = out['close'].pct_change(10).shift(1)
         delta = out['close'].astype(float).diff()
@@ -57,12 +57,15 @@ class FeatureFactory:
 
         # Strict PIT: shift price-derived features so trading at bar t uses info up to t-1
         shift_cols = [
-            'return_1p','volatility_20p','momentum_10p','rsi_14','sma_50','close_vs_sma50','round_proximity'
+            'volatility_20p','sma_50','close_vs_sma50','round_proximity'
         ]
         for c in shift_cols:
             if c in out.columns:
                 out[c] = out[c].shift(1)
 
-        out = out.dropna()
+        # Preserve full timeline (do NOT drop leading NaNs from rolling/shifted features) for PIT alignment tests.
+        # Only enforce removal if core price fields are NaN.
+        core_cols = ['open','high','low','close','volume']
+        out = out.dropna(subset=[c for c in core_cols if c in out.columns])
         out = out.set_index('timestamp')
         return out

@@ -62,6 +62,16 @@ class SymbolResolver:
         self.policy = ResolverPolicy(allowed_g, allowed_by, base_aliases, ttl)
         self._cache.clear()
 
+    def add_alias(self, base: str, alias: str):
+        base, alias = base.upper(), alias.upper()
+        ba = self.policy.base_aliases or {}
+        cur = list(ba.get(base, []))
+        if alias not in cur:
+            cur.append(alias)
+            ba[base] = cur
+            self.policy.base_aliases = ba
+        self._cache.clear()
+
     def _allowed_quotes_for(self, venue_id: str) -> Tuple[str, ...]:
         aqbv = self.policy.allowed_quotes_by_venue or {}
         return aqbv.get(venue_id, self.policy.allowed_quotes_global)
@@ -122,3 +132,6 @@ def get_resolver() -> SymbolResolver:
 
 def configure(policy_dict: Dict[str, object] | None):
     _GLOBAL_RESOLVER.configure(policy_dict)
+
+def add_alias(base: str, alias: str):
+    _GLOBAL_RESOLVER.add_alias(base, alias)

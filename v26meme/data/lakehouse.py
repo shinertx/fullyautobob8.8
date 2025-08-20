@@ -1,6 +1,6 @@
 from pathlib import Path
 import pandas as pd
-from typing import Optional
+from typing import Optional, List  # added List
 
 class Lakehouse:
     """
@@ -45,10 +45,19 @@ class Lakehouse:
                     df = df.iloc[:-1]
         return df
 
-    def get_available_symbols(self, timeframe: str) -> list:
+    def get_available_symbols(self, timeframe: str) -> list[str]:
+        """Return a deduplicated, sorted list of canonical symbols with data for timeframe.
+
+        PIT Note: Only inspects file presence (closed bars already materialized). No
+        loading of partial/in-flight parquet content occurs here. Duplicates can
+        arise because each month stores a separate parquet for the same symbol;
+        this method collapses them into unique canonical identifiers.
+        """
         p = self.base_path / self.preferred_exchange / timeframe
-        if not p.exists(): 
-            # legacy fallback
+        if not p.exists():
+            # legacy fallback (flat layout) — keep deterministic ordering
             p2 = self.base_path / timeframe
-            return [q.stem for q in p2.glob("*.parquet")] if p2.exists() else []
-        return [q.stem for q in p.glob("*/**/*.parquet")]
+            return sorted({q.stem for q in p2.glob("*.parquet")}) if p2.exists() else []
+        # Collect stems across year/month partitions then dedupe
+        symbols: set[str] = {q.stem for q in p.glob("**/*.parquet")}
+        return sorted(symbols)

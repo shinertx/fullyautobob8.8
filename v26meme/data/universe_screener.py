@@ -1,9 +1,11 @@
 from typing import List, Dict, Any, Tuple
 from loguru import logger
 import ccxt, time
+from v26meme.data.token_bucket import TokenBucket  # NEW
 
 from v26meme.data.usd_fx import USDFX
 from v26meme.registry.canonical import make_canonical
+from v26meme.registry.resolver import get_resolver  # NEW: dynamic quote policy
 
 def _spread_bps(t: dict) -> float:
     bid, ask = t.get('bid'), t.get('ask')
@@ -60,6 +62,13 @@ class UniverseScreener:
         for ex in exchanges:
             try:
                 obj = getattr(ccxt, ex)()
+                # Harden network/rate behavior
+                try:
+                    obj.enableRateLimit = True
+                    if not getattr(obj, 'timeout', None) or obj.timeout < 10_000:
+                        obj.timeout = 10_000
+                except Exception:
+                    pass
                 obj.load_markets()
                 self.exchanges[ex] = obj
             except Exception as e:
@@ -69,7 +78,27 @@ class UniverseScreener:
         of_cfg = self.feeds.get('orderflow', {})
         self.orderflow_enabled = bool(of_cfg.get('enabled', False))
         self.orderflow_top = int(of_cfg.get('top_levels', 5))
-        self.allowed_quotes = ("USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD")
+        # removed hard-coded allowed_quotes; use registry policy instead
+        self.exclude_stable_stable = bool(screener_cfg.get('exclude_stable_stable', False))
+        self._stable_set = {"USDT","USDC","DAI","FDUSD","TUSD","PYUSD"}
+        self._resolver = get_resolver()  # dynamic access to policy
+        quotas = (screener_cfg.get('quotas') or {})
+        self._buckets: Dict[str, TokenBucket] = {}
+        for ex_id in self.exchanges.keys():
+            q = quotas.get(ex_id, {})
+            self._buckets[ex_id] = TokenBucket(q.get('max_requests_per_min', 60), q.get('min_sleep_ms', 200))
+        # NEW: merge venue alias mappings (commonCurrencies) into resolver base_aliases
+        try:
+            from v26meme.registry.resolver import add_alias  # type: ignore
+            for ex_id, ex in self.exchanges.items():
+                ccmap = getattr(ex, 'commonCurrencies', {}) or {}
+                for alt, uni in ccmap.items():
+                    try:
+                        add_alias(uni, alt)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
 
     def get_active_universe(self) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, dict]]]:
         logger.info(f"[screener] SENTINEL enter get_active_universe spread_cap={self.cfg.get('max_spread_bps')} impact_cap={self.cfg.get('max_impact_bps')} order_usd={self.cfg.get('typical_order_usd')} volume_min={self.cfg.get('min_24h_volume_usd')}")
@@ -77,6 +106,9 @@ class UniverseScreener:
         tickers_by_venue: Dict[str, Dict[str, dict]] = {}
         for name, ex in self.exchanges.items():
             try:
+                b = self._buckets.get(name)
+                if b: b.consume(1)
+                # rely on global timeout/rateLimit; no per-call params timeout (doctrine compliance)
                 tickers_by_venue[name] = ex.fetch_tickers()
             except Exception as e:
                 logger.error(f"fetch_tickers failed on {name}: {e}")
@@ -103,7 +135,12 @@ class UniverseScreener:
 
                 # Early quote + price filters
                 quote = m.get("quote")
-                if quote not in self.allowed_quotes:
+                # Dynamic allowed quotes per venue from registry policy (falls back to global list)
+                policy = getattr(self._resolver, 'policy', None)
+                if policy is None:
+                    continue
+                allowed_quotes = (getattr(policy, 'allowed_quotes_by_venue', {}) or {}).get(venue, getattr(policy, 'allowed_quotes_global', []))
+                if quote not in allowed_quotes:
                     continue
                 if price < float(self.cfg.get('min_price', 0.0)):
                     continue
@@ -135,6 +172,8 @@ class UniverseScreener:
                 if spr == float('inf') or spr > self.cfg['max_spread_bps']: continue
 
                 base, quote = m.get("base"), m.get("quote")
+                if self.exclude_stable_stable and base in self._stable_set and quote in self._stable_set:
+                    continue
                 canonical = make_canonical(base, quote, kind="SPOT")
                 inst = {
                     "venue": venue, "type": "spot",
@@ -165,6 +204,8 @@ class UniverseScreener:
         for (inst, vol) in short:
             ex = self.exchanges[inst['venue']]
             try:
+                b = self._buckets.get(inst['venue'])
+                if b: b.consume(1)
                 imp = _impact_bps(ex, inst['venue_symbol'], self.cfg['typical_order_usd'], inst.get('usd_per_quote', 1.0))
                 impact_attempts += 1
                 if imp == float('inf'):
@@ -214,6 +255,8 @@ class UniverseScreener:
                 for venue, inst_list in by_venue.items():
                     try:
                         ex = self.exchanges[venue]
+                        b = self._buckets.get(venue)
+                        if b: b.consume(1)
                     except Exception as e:
                         logger.warning(f"Orderflow features: could not init {venue}: {e}")
                         continue

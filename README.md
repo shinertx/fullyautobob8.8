@@ -78,7 +78,20 @@ cd v26meme
 ./install_and_launch_v475.sh
 ```
 
+> NOTE: Environments without a `python` shim now automatically detect `python3` in the launcher script. If invoking manually, use:
+>
+> ```bash
+> python3 -m v26meme.cli loop
+> ```
+
+NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `python3` explicitly (all examples below updated).
+
 **Dependencies pinned** in `requirements.txt`.  
+**Dashboards / Labs:**
+- Dashboard: http://localhost:8601 (Streamlit GUI)
+- Hyper Lab Dashboard: http://localhost:8610 (EIL survivors & metrics)
+- Hyper Lab (headless batch EIL) reserved port env: HYPER_LAB_PORT=8610 (no HTTP server yet; future UI can bind here)
+
 **Dashboard:** http://localhost:8601
 
 ---
@@ -105,6 +118,14 @@ cd v26meme
 ---
 
 ## 🔄 Recent Enhancements
+
++ **Alpha Registry Hygiene (2025-08-19):** Automatic per-cycle maintenance now cleans `active_alphas` by (1) removing duplicate ids (order-preserving), (2) trimming trailing zero-return padding beyond recorded `n_trades` (up to `discovery.max_return_padding_trim`, default 5) to prevent correlation / variance skew, and (3) optionally retro-enforcing current promotion gates when `discovery.enforce_current_gates_on_start=true`. A single JSON log line `[hygiene] {...}` summarizes actions (dupes_removed, trimmed, dropped_gates, final). Disable retro enforcement by leaving the flag false (default) to avoid sudden portfolio contraction.
++ **Fast Bootstrap Pipeline (2025-08-19):** Added `harvester.bootstrap_mode: parallel` (placeholder worker hook) to allow deep backfill to execute out-of-band while the main loop begins discovery on shallow data.
++ **Partial Harvest Timeframe Rotation:** `harvester.partial_harvest: true` processes only one timeframe per loop cycle (round‑robin) to reach minimal research coverage faster (e.g. fill `1h` before grinding lower granularities). State key `harvest:partial:tf_index` tracks rotation.
++ **Coverage Gate & Escalation:** Research is deferred until at least `discovery.min_panel_symbols` symbols have both (a) >= `harvester.min_coverage_for_research` coverage ratio and (b) >= `discovery.min_bars_per_symbol` bars on the research timeframe (default 1h). After the first promotion, threshold escalates to `harvester.high_coverage_threshold` (flag `coverage:raise_threshold`). Gate can be disabled via `discovery.defer_until_coverage: false`.
++ **Priority Symbols:** `harvester.priority_symbols` harvested first each cycle to seed flagship bases (BTC, ETH, SOL by default) ensuring early panel viability and adaptive knob calculation.
++ **Promotion Threshold Buffer Escalation:** First successful promotion sets a state flag raising the coverage requirement to accelerate depth-building before scaling additional alphas.
++ **Expanded Config Knobs:** Added `discovery.min_panel_symbols`, `discovery.min_bars_per_symbol`, `harvester.min_coverage_for_research`, `harvester.high_coverage_threshold`, and lane smoothing parameters (`lanes.smoothing_alpha`, `lanes.dead_band`, `lanes.max_step_per_cycle`, probation & retag blocks) — all adaptive & testable.
 
 * **Deflated Sharpe Gate (2025-08-19):** Activated probabilistic overfit filter (`validation.dsr.enabled=true`, `min_prob=0.60`). Strategies must clear deflated Sharpe confidence threshold after BH-FDR.
 * **On-Demand Harvest Queue:** `eil:harvest:requests` now drained each cycle; queued canonicals are force-included in the harvester plan (all configured timeframes) for next ingestion.
@@ -138,6 +159,18 @@ Run:
 
 ```bash
 pytest tests/
+```
+
+Or run the main autonomous loop directly:
+
+```bash
+python3 -m v26meme.cli loop
+```
+
+Debug the screener only:
+
+```bash
+python3 -m v26meme.cli debug_screener
 ```
 
 Covers:
