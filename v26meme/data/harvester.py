@@ -8,6 +8,7 @@ import json, ast, math
 from typing import List, Dict, Any, Iterable, Set, Awaitable, Union, Optional, Tuple
 import glob  # NEW: for aggregation file discovery
 from collections.abc import Awaitable as _Awaitable  # ensure available early
+from dataclasses import dataclass  # NEW: for typed config helpers
 
 def _sync(val):  # always defined before any use
     try:
@@ -32,6 +33,106 @@ TF_MS = {
     "6h": 21_600_000,  # added for coinbase aliasing
     "1d": 86_400_000,
 }
+
+# NEW -----------------------------------------------------------------
+@dataclass
+class CheckpointReconcileConfig:
+    enabled: bool = False
+    min_lag_bars: int = 3
+    max_forward_bars: int = 1_000_000  # safety upper bound (large to allow deep correction)
+
+
+def _load_reconcile_cfg(cfg: dict) -> CheckpointReconcileConfig:
+    h = (cfg.get('harvester') or {}).get('checkpoint_reconcile') or {}
+    return CheckpointReconcileConfig(
+        enabled=bool(h.get('enabled', False)),
+        min_lag_bars=int(h.get('min_lag_bars', 3)),
+        max_forward_bars=int(h.get('max_forward_bars', 1_000_000)),
+    )
+
+
+def _iter_parquet_tails(base_dir: Path, exchanges: Iterable[str]) -> Iterable[tuple[str,str,str,int]]:
+    """Yield (exchange, timeframe, canonical, tail_ts_ms) for every discovered parquet symbol.
+
+    PIT Note: Pure filesystem metadata traversal (timestamps intrinsic to bars). Deterministic.
+    """
+    for ex in exchanges:
+        ex_path = base_dir / ex
+        if not ex_path.exists():
+            continue
+        for tf_dir in ex_path.iterdir():
+            if not tf_dir.is_dir():
+                continue
+            tf = tf_dir.name
+            if tf not in TF_MS:
+                continue
+            for yy_dir in tf_dir.iterdir():
+                if not yy_dir.is_dir():
+                    continue
+                for mm_dir in yy_dir.iterdir():
+                    if not mm_dir.is_dir():
+                        continue
+                    for f in mm_dir.glob('*.parquet'):
+                        canonical = f.stem
+                        try:
+                            import pandas as _pd
+                            df_tail = _pd.read_parquet(f, columns=['timestamp'])
+                            if df_tail.empty:
+                                continue
+                            ts_ms = int(df_tail['timestamp'].max().timestamp() * 1000)
+                            yield ex, tf, canonical, ts_ms
+                        except Exception:
+                            continue
+
+
+def reconcile_checkpoints(cfg: dict, state: 'StateManager', base_dir: Path) -> Dict[str, Any]:
+    """Fast-forward lagging checkpoints to parquet tails (minus one bar) when drift large.
+
+    Returns summary dict for telemetry & tests.
+
+    Guardrails:
+      - Only forward (never backward) adjustments.
+      - Require lag >= min_lag_bars * tf_ms.
+      - Cap forward distance at max_forward_bars to prevent accidental skip over extremely large gaps unless explicitly configured.
+    """
+    rcfg = _load_reconcile_cfg(cfg)
+    summary: Dict[str, Any] = {"adjusted": 0, "scanned": 0, "details": []}
+    if not rcfg.enabled:
+        return summary
+    seen_keys: set[tuple[str,str,str]] = set()
+    for ex, tf, canonical, tail_ts_ms in _iter_parquet_tails(base_dir, cfg.get('data_source', {}).get('exchanges', [])):
+        summary['scanned'] += 1
+        key = (ex, tf, canonical)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        tf_ms = TF_MS.get(tf)
+        if not tf_ms:
+            continue
+        current = Checkpoints(state).get(ex, canonical, tf)
+        if current is None:
+            continue  # initial harvest will set; do not synthesize new
+        lag_ms = tail_ts_ms - current
+        if lag_ms <= 0:
+            continue  # already at / ahead of tail (ahead shouldn't happen)
+        lag_bars = lag_ms // tf_ms
+        if lag_bars < rcfg.min_lag_bars:
+            continue
+        if lag_bars > rcfg.max_forward_bars:
+            # large anomaly; skip unless user raised cap
+            continue
+        new_ckp = tail_ts_ms - tf_ms  # last fully closed bar
+        Checkpoints(state).set(ex, canonical, tf, new_ckp)
+        summary['adjusted'] += 1
+        summary['details'].append({
+            'ex': ex, 'tf': tf, 'canonical': canonical,
+            'old': current, 'new': new_ckp, 'lag_bars': int(lag_bars)
+        })
+    if summary['adjusted']:
+        logger.info(f"[harvest] checkpoint_reconcile adjusted={summary['adjusted']} scanned={summary['scanned']}")
+        state.set('harvest:checkpoint_reconcile:last', summary)
+    return summary
+# ---------------------------------------------------------------------
 
 def _write_partitioned_parquet(base_dir: Path, exchange: str, tf_resolved: str, canonical: str, df: pd.DataFrame, meta: Dict[str, Any]) -> int:
     """Partition-aware atomic write.
@@ -428,6 +529,26 @@ def _maybe_aggregate_timeframes(cfg: dict, state: 'StateManager', base_dir: Path
 
     aggregated = 0
     improved = 0
+    skipped_native = 0  # NEW: count symbols skipped due to sufficient native rows
+    # NEW: bootstrap aggregation: enumerate source timeframe symbols lacking ANY target parquet to seed coverage
+    bootstrap_missing: Dict[str, set[str]] = {ex: set() for ex in cfg.get('data_source', {}).get('exchanges', [])}
+    for ex_id in bootstrap_missing.keys():
+        src_root = base_dir / ex_id / src_tf
+        if not src_root.exists():
+            continue
+        # gather symbols from source partitions
+        source_symbols: set[str] = set()
+        for f in src_root.glob('*/??/*.parquet'):
+            source_symbols.add(f.stem)
+        # for each symbol check target existence
+        for sym in source_symbols:
+            tgt_glob = list((base_dir / ex_id / target_tf).glob(f"**/{sym}.parquet"))
+            if not tgt_glob:
+                bootstrap_missing[ex_id].add(sym)
+    # merge low_cov + bootstrap_missing
+    for ex_id, miss_syms in bootstrap_missing.items():
+        if miss_syms:
+            low_cov.setdefault(ex_id, set()).update(miss_syms)
     for ex_id, symbols in low_cov.items():
         if not symbols:
             continue
@@ -449,6 +570,22 @@ def _maybe_aggregate_timeframes(cfg: dict, state: 'StateManager', base_dir: Path
                         continue
             if not parts:
                 continue
+            # If native coverage already above threshold, skip but count
+            if canonical not in bootstrap_missing.get(ex_id, set()):
+                try:
+                    cov_raw = state.r.hget('harvest:coverage', f"{ex_id}:{target_tf}:{canonical}")
+                    if cov_raw:
+                        if isinstance(cov_raw, bytes):
+                            cov_raw = cov_raw.decode('utf-8')
+                        cov_raw = _sync(cov_raw)
+                        if cov_raw:
+                            meta_cov = json.loads(cov_raw)
+                            if int(meta_cov.get('actual',0)) >= min_rows:
+                                skipped_native += 1
+                                logger.debug(f"[harvest] aggregate_skip native_ok ex={ex_id} sym={canonical} rows={meta_cov.get('actual')} threshold={min_rows}")
+                                continue
+                except Exception:
+                    pass
             try:
                 df_src = pd.concat(parts, ignore_index=True).drop_duplicates(subset=['timestamp'])
             except Exception:
@@ -473,7 +610,7 @@ def _maybe_aggregate_timeframes(cfg: dict, state: 'StateManager', base_dir: Path
                 continue
             df_src = df_src.set_index('timestamp')
             try:
-                ohlc = df_src.resample('1H', label='right', closed='right').agg({
+                ohlc = df_src.resample('1h', label='right', closed='right').agg({  # lower-case freq to silence future warning
                     'open': 'first',
                     'high': 'max',
                     'low': 'min',
@@ -508,12 +645,15 @@ def _maybe_aggregate_timeframes(cfg: dict, state: 'StateManager', base_dir: Path
                     'last_ts': int(final_df['timestamp'].max().timestamp()*1000),
                     'source_tail_hours': max_tail_hours,
                     'native_rows_threshold': min_rows,
+                    'bootstrap_missing': canonical in bootstrap_missing.get(ex_id, set()),  # NEW meta
                 })
                 aggregated += 1
             except Exception:
                 continue
     if aggregated:
-        logger.info(f"[harvest] aggregated_timeframes built target=1h from={src_tf} symbols={aggregated} improved={improved}")
+        logger.info(f"[harvest] aggregated_timeframes built target=1h from={src_tf} symbols={aggregated} improved={improved} skipped_native={skipped_native}")
+    elif skipped_native:
+        logger.info(f"[harvest] aggregated_timeframes skipped target=1h native_ok={skipped_native}")
 
 def run_once(cfg, state: StateManager, partial_mode: bool | None = None):
     """Harvest one cycle of OHLCV data (event-sourced, QA-gated).
@@ -541,6 +681,11 @@ def run_once(cfg, state: StateManager, partial_mode: bool | None = None):
         partial_mode = bool((cfg.get('harvester') or {}).get('partial_harvest', False))
     logger.info("[harvest] run_once invoked (event-sourced cycle start)" + (" partial" if partial_mode else ""))
     base_dir = Path("./data")
+    # NEW: reconcile checkpoints early (before planning) to eliminate drift starvation
+    try:
+        reconcile_checkpoints(cfg, state, base_dir)
+    except Exception as e:
+        logger.warning(f"checkpoint_reconcile error: {e}")
     quotas = cfg["harvester"].get("quotas", {})
     plan = _build_plan(cfg, state)
     plan = _enrich_plan_with_queue(plan, state)
@@ -626,10 +771,48 @@ def run_once(cfg, state: StateManager, partial_mode: bool | None = None):
                         days_candidate = per_ex_boot.get(ex_id, {}).get(tf)
                     except Exception:
                         days_candidate = None
-                    base_days = cfg["harvester"]["bootstrap_days_default"].get(tf, 30)
+                    # Hardened: tolerate missing bootstrap_days_default key
+                    boot_defaults = ((cfg.get('harvester') or {}).get('bootstrap_days_default') or {})  # type: ignore[assignment]
+                    base_days = boot_defaults.get(tf, 30)
                     override_days = bootstrap_overrides.get(tf, base_days)
                     days = int(days_candidate if days_candidate is not None else override_days)
                     since = ex.milliseconds() - 86_400_000 * days
+                else:
+                    # Adaptive deep backfill check (PIT-safe): if a checkpoint exists but historical depth
+                    # is materially below the intended bootstrap horizon (using min_coverage_for_research
+                    # as gating fraction), force a one-time deeper rewind of 'since'. This prevents the
+                    # shallow 1h history (e.g. 2-3 bars) scenario from blocking research.
+                    try:
+                        min_cov = float(cfg['harvester'].get('min_coverage_for_research', 0.30))
+                        per_ex_boot = ((cfg.get('harvester') or {}).get('per_exchange_bootstrap') or {})
+                        target_days = per_ex_boot.get(ex_id, {}).get(tf)
+                        if target_days is None:
+                            boot_defaults = ((cfg.get('harvester') or {}).get('bootstrap_days_default') or {})
+                            target_days = boot_defaults.get(tf, 30)
+                        # Only apply to higher timeframes where staged_backfill is not active
+                        if tf in ('1h','4h','1d') and target_days:
+                            # Count existing rows (all partitions) without loading entire data twice
+                            hist_path = base_dir / ex_id / tf
+                            # Efficient glob of symbol parquet partition files
+                            parts = list(hist_path.glob(f"**/{canonical}.parquet")) if hist_path.exists() else []
+                            existing_rows = 0
+                            for pp in parts:
+                                try:
+                                    import pandas as _pd
+                                    existing_rows += len(_pd.read_parquet(pp))
+                                except Exception:
+                                    pass
+                            tf_sec = tf_ms / 1000.0
+                            expected_rows_boot = int((target_days * 86400) / tf_sec)
+                            coverage_ratio = (existing_rows / expected_rows_boot) if expected_rows_boot > 0 else 0.0
+                            if coverage_ratio < min_cov:
+                                rewind_days = int(target_days)
+                                new_since = ex.milliseconds() - 86_400_000 * rewind_days
+                                if new_since < since - tf_ms * 10:  # ensure meaningful rewind
+                                    logger.info(f"deep_backfill_override {ex_id} {tf} {canonical}: coverage={coverage_ratio:.2f} < {min_cov:.2f} forcing {rewind_days}d history (was checkpoint since={since})")
+                                    since = new_since
+                    except Exception:
+                        pass
                 limit = 1000
                 if ex_id == 'coinbase':
                     limit = 300

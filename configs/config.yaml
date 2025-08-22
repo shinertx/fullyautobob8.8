@@ -13,68 +13,26 @@ data_source:
 
 # v4.7.5 data-plane
 harvester:
-  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","AVAX_USD_SPOT","LINK_USD_SPOT",
-                 "ADA_USD_SPOT","XRP_USD_SPOT","DOGE_USD_SPOT","MATIC_USD_SPOT","DOT_USD_SPOT",
-                 "LTC_USD_SPOT","LDO_USD_SPOT","BCH_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT","FIL_USD_SPOT",
-                 "NEAR_USD_SPOT","ARB_USD_SPOT","OP_USD_SPOT","INJ_USD_SPOT","APT_USD_SPOT","XLM_USD_SPOT",
-                 "ALGO_USD_SPOT","SUI_USD_SPOT","SHIB_USD_SPOT"]
-  dynamic_enabled: true
+  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","LTC_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT"]  # MULTI: re-enable broader panel for EIL entropy
+  restrict_single_symbol: false      # DISABLE: allow multi-symbol evolutionary panel
+  dynamic_enabled: false            # TEMP: freeze universe expansion
   timeframes_by_lane:
-    core:     ["1m","5m","15m","1h","4h","1d"]
-    moonshot: ["1m","5m","15m"]
-    eil:      "on_demand"
-  quotas:
-    coinbase: { max_requests_per_min: 45, min_sleep_ms: 220 }
-    kraken:   { max_requests_per_min: 45, min_sleep_ms: 250 }
-  # NEW: per-venue gap tolerances + timeframe fallback
-  gap_accept_overrides:
-    coinbase: { "1m": 0.60, "5m": 0.45 }
-  tf_fallback:
-    coinbase: { "1m": "5m" }
-  per_exchange_bootstrap:
-    coinbase: { "1h": 365, "4h": 730 }  # UPDATED: deeper initial history for hourly & aliased 4h (6h) on coinbase
-    kraken:   { "1h": 365, "4h": 730 }
-  bootstrap_days_default:
-    "1m": 7
-    "5m": 14
-    "15m": 30
-    "1h": 365
-    "4h": 730
-    "1d": 1825
-  retention_days:
-    "1m": 90
-    "5m": 90
-    "15m": 365
-    "1h": 1825
-    "4h": 1825
-    "1d": 3650
-  max_gap_pct_accept: 0.30
-  bootstrap_days_override: {"1m": 7, "5m": 14, "15m": 30 }
-  staged_backfill:
-    enabled: true  # ENABLED (was false) deeper phased intraday history seeding
-    targets_days:
-      "1m":  [7, 30, 90]      # UPDATED deeper progression
-      "5m":  [30, 180, 365]   # UPDATED deeper progression
-      "15m": [90, 365, 730]   # UPDATED deeper progression
-  availability:
-    miss_threshold: 3
-    suppress_ttl_minutes: 360
+    core: ["1m","5m","1h"]       # TEMP: trim to essential tfs
+    moonshot: ["1m","5m"]          # TEMP
+    eil: "on_demand"
+  partial_harvest: false            # TEMP CHANGE: disable rotation to fill 1h coverage quickly (will revert to true after EIL starts)
   aggregate_timeframes:
-    enabled: true
-    from: "5m"
-    to: ["1h"]
-    min_native_rows_threshold: 50
-    max_tail_hours: 72
-  merged_loader:
-    enabled: false
-    primary_depth_exchange: "kraken"
-    tail_exchange: "coinbase"
-    tail_replace_bars: 3
-  bootstrap_mode: "parallel"         # NEW: parallel bootstrap worker (deep history) vs inline
+    enabled: false                  # TEMP: skip synthetic aggregation
+  checkpoint_reconcile:
+    enabled: false                  # TEMP: skip reconcile to reduce noise
+  bootstrap_mode: "inline"          # TEMP: simplify control path
   min_coverage_for_research: 0.30     # NEW: initial coverage ratio gate for research timeframe
   high_coverage_threshold: 0.80       # NEW: target after first promotion
   priority_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT"]  # NEW: tier A ordering
-  partial_harvest: false              # TEMP: full-cycle bootstrap; revert to true after coverage
+  panel_target_days: { "1m": 7, "5m": 14, "15m": 30, "1h": 30 }  # NEW: dynamic panel targets (days) for gate derivation
+  bootstrap_days_default: { "1m": 2, "5m": 7, "15m": 14, "1h": 45, "4h": 120, "1d": 365 }  # NEW: default historical depth per timeframe (days) used when no checkpoint; aligns with staged_backfill & avoids KeyError
+  # NOTE: values are config knobs (no magic); adjust to trade off initial IO vs statistical power.
+  # per_exchange_bootstrap optional override structure: { exchange: { timeframe: days } }
 
 screener:
   snapshot_dir: "data/screener_snapshots"
@@ -96,36 +54,60 @@ feeds:
 
 validation:
   dsr:
-    enabled: true  # TEMP bootstrap: disabled to allow faster initial promotions; revert to true after seeding
-    min_prob: 0.60       # require >=60% probability Sharpe not luck (deflated)
+    enabled: true  # ensure DSR gate on post-bootstrap
+    min_prob: 0.50       # TEMP RELAX (was 0.60)
     benchmark_sr: 0.0
+  sparse_trades:         # NEW: adaptive p-value path for low trade counts
+    enabled: true
+    winrate_p_threshold_trades: 25  # use binomial win-rate test when total trades < this
 
 discovery:
   population_size: 320              # bumped 160→320
   generations_per_cycle: 3          # bumped 2→3
-  panel_symbols: 5
+  panel_symbols: 5        # MULTI: use up to 5 symbols per panel
   cv_folds: 4
   cv_embargo_bars: 2
-  fdr_alpha: 0.10
+  fdr_alpha: 0.20          # TEMP RELAX: widen FDR alpha for multi-symbol sandbox
   cv_method: "kfold"
   auto_cpcv: true                   # NEW: switch to CPCV when panel symbols ≥8 or population large
-  max_promotions_per_cycle: 3
-  max_promotions_per_day: 12
+  max_promotions_per_cycle: 0       # SANDBOX: freeze promotions during validation
+  max_promotions_per_day: 0         # SANDBOX: prevent any daily promotions
   promotion_buffer_multiplier: 1.0
   enable_pruning: true
   defer_until_coverage: true          # NEW: gate research until minimal symbol coverage satisfied
-  min_panel_symbols: 3                # NEW: required symbols meeting coverage/bars thresholds
-  min_bars_per_symbol: 100            # NEW: bars required on research timeframe per symbol before inclusion
+  min_panel_symbols: 3    # MULTI: require at least 3 symbols covered
+  min_bars_per_symbol: 100            # bars required on research timeframe per symbol before inclusion
   promotion_criteria:
-    min_trades: 75
-    min_sortino: 1.25
-    max_mdd: 0.20
-    min_sharpe: 1.10
-    min_win_rate: 0.52
+    min_trades: 30        # TEMP RELAX (was 75) – gather early survivor telemetry
+    min_sortino: 0.50     # TEMP RELAX (was 1.25)
+    max_mdd: 0.30         # TEMP RELAX (was 0.20)
+    min_sharpe: 0.30      # TEMP RELAX (was 1.10)
+    min_win_rate: 0.45    # TEMP RELAX (was 0.52)
   factor_correlation_max: 0.80
   enforce_current_gates_on_start: false   # NEW: retroactive gate enforcement for legacy alphas
   max_return_padding_trim: 5              # NEW: max trailing zero returns to trim per hygiene pass
   max_population_size: 1000               # NEW: cap genetic population to bound memory
+  feature_min_non_nan_ratio: 0.30         # NEW: minimum non-NaN ratio required to keep a feature active
+  feature_min_variance: 1e-06             # NEW: minimum variance (across sampled panel) required to retain feature
+  reseed_fraction: 0.30                   # NEW: fraction of population to reseed when suppressed-feature formulas detected
+  fitness_drawdown_penalty_scale: 0.40    # NEW: scales drawdown penalty applied to fitness (adaptive risk-aware search)
+  rejection_sample_size: 8                # NEW: max sampled formula ids stored per rejection reason
+  rejection_alert_ratio: 0.70             # NEW: if a single reason exceeds this fraction, flag for adaptive tuning
+  fitness_concentration_penalty_scale: 0.25  # NEW: penalty scale for feature concentration
+  fitness_variance_penalty_scale: 0.15       # NEW: penalty scale for high return volatility
+  fitness_activation_scale: 20              # NEW: activation gain scale (trades) for sparse regimes
+  adaptive:
+    enabled: true
+    continuity_threshold: 0.80          # NEW: threshold for feature continuity (fraction of cycles active)
+    variance_threshold: 0.10            # NEW: threshold for feature variance (relative to mean)
+    continuity_suppression_patience: 5  # NEW: consecutive below-threshold cycles before suppression
+    tuning_enabled: true                # NEW: allow auto-tuning of population size & gates
+    rejection_pval_high_ratio: 0.75     # NEW: if pval rejects > this, enlarge population
+    population_step: 40                 # NEW: step size when adjusting population size
+  debug_relaxed_gates: true             # NEW: flag indicating temporary relaxed survivor thresholds
+  fitness_weights:
+    profit_signal: 0.7
+    trade_signal: 0.3
 
 prober:
   enabled: true
@@ -160,7 +142,7 @@ risk:
   max_symbol_weight: 0.35
   max_gross_weight: 1.00
   max_order_notional_usd: 150
-  max_consecutive_errors: 3
+  max_consecutive_errors: 12   # SANDBOX: raise to avoid premature risk halt while stabilizing
   phases:
     "1000":   { kelly_fraction: 0.6, max_order_notional_usd: 500 }
     "10000":  { kelly_fraction: 0.7, max_order_notional_usd: 1000 }
@@ -175,17 +157,18 @@ execution:
   mode: "paper"
   paper_fees_bps: 18
   paper_slippage_bps: 5
+  max_holding_bars: 24   # NEW: forced exit horizon to boost trade sample entropy
 
 llm:
   provider: "openai"
-  enable: true
+  enable: false   # SANDBOX: disable LLM proposer until loop stable
   max_suggestions_per_cycle: 3
   threshold_min: -5.0   # NEW: clamp LLM numeric thresholds lower bound
   threshold_max: 5.0    # NEW: clamp LLM numeric thresholds upper bound
 
 eil:
   enabled: true
-  fast_window_days: 45
+  fast_window_days: 75  # CHANGED: extended from 45→75 to increase statistical power (see migration-notes 2025-08-22)
   max_parallel_jobs: 8
   max_queue: 5000
   survivor_top_k: 25

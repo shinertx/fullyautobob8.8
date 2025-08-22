@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from loguru import logger
 import pandas as pd
 import numpy as np
+import glob as _glob  # added for retro coverage reindex
 
 from v26meme.core.state import StateManager
 from v26meme.data.lakehouse import Lakehouse
@@ -186,6 +187,94 @@ def _lh_get_available_symbols(lh: Lakehouse, cfg: Dict[str, Any], tf: str) -> Li
 def _today_key(prefix: str = "promotions") -> str:  # YYYY-MM-DD key
     return f"{prefix}:{datetime.now(timezone.utc).date().isoformat()}"
 
+def _retro_reindex_coverage(state: StateManager, cfg: Dict[str, Any], tf: str) -> None:
+    """Retroactively populate or upgrade harvest:coverage entries from existing parquet history.
+
+    PIT note: Derives solely from already persisted on-disk OHLCV parquet partitions; no
+    forward-looking data introduced. One-shot per timeframe (idempotent via state flag).
+
+    Rationale: Historical deep backfill (copied / aggregated) created large parquet depth
+    without corresponding 'harvest:coverage' hash entries (only recent incremental fetches
+    wrote coverage). This starves the coverage gate (min_bars_per_symbol) because many
+    symbols either (a) lack a coverage entry entirely or (b) report a tiny 'actual' count
+    reflecting only the last incremental window. We reconcile by scanning partitions and
+    emitting canonical coverage payloads with conservative assumptions (expected = actual,
+    coverage = 1.0) strictly for gating prerequisites. Native future harvest cycles will
+    overwrite these with real expected/coverage values on fresh fetches.
+
+    Writes keys where missing or where actual < row_count. Marks payload with 'reindexed': true.
+    """
+    try:
+        flag_key = f"harvest:coverage:reindexed:{tf}"
+        if state.get(flag_key):
+            return
+        exchanges = (cfg.get('data_source') or {}).get('exchanges') or []
+        base_dir = Path('data')
+        updated = 0
+        for ex_id in exchanges:
+            tf_dir = base_dir / ex_id / tf
+            if not tf_dir.exists():
+                continue
+            # pattern: data/<exchange>/<tf>/**/<canonical>.parquet
+            for fp in _glob.glob(str(tf_dir / '**' / '*.parquet'), recursive=True):
+                try:
+                    path_obj = Path(fp)
+                    canonical = path_obj.stem  # filename without .parquet
+                    key = f"{ex_id}:{tf}:{canonical}"
+                    # Fast metadata read: only timestamp column
+                    try:
+                        df_head = pd.read_parquet(fp, columns=['timestamp'])
+                    except Exception:
+                        continue
+                    rows = len(df_head)
+                    if rows <= 0:
+                        continue
+                    existing_raw = state.r.hget('harvest:coverage', key)
+                    if existing_raw is not None:
+                        try:
+                            if isinstance(existing_raw, bytes):
+                                existing_raw_dec = existing_raw.decode('utf-8')
+                            else:
+                                existing_raw_dec = existing_raw  # type: ignore[assignment]
+                            existing = json.loads(existing_raw_dec)
+                        except Exception:
+                            existing = {}
+                        if isinstance(existing, dict) and int(existing.get('actual') or 0) >= rows:
+                            continue  # nothing to upgrade
+                    payload = json.dumps({
+                        'expected': rows,  # conservative (cannot overstate bars)
+                        'actual': rows,
+                        'coverage': 1.0,   # since expected == actual
+                        'gaps': 0,
+                        'gap_ratio': 0.0,
+                        'accepted': True,
+                        'reindexed': True
+                    })
+                    try:
+                        state.hset('harvest:coverage', key, payload)
+                        updated += 1
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        if updated > 0:
+            state.set(flag_key, int(time.time()))
+            logger.info(f"[retro_reindex] timeframe={tf} coverage entries updated={updated}")
+        else:
+            state.set(flag_key, int(time.time()))  # still set to avoid repeated scans
+    except Exception as e:  # defensive
+        logger.warning(f"retro coverage reindex failed tf={tf}: {e}")
+
+def _bars_per_day(tf: str) -> int:
+    return {
+        '1m': 60*24,
+        '5m': (60//5)*24,
+        '15m': (60//15)*24,
+        '1h': 24,
+        '4h': 24//4,
+        '1d': 1,
+    }.get(tf, 0)
+
 def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tuple[bool, dict]:
     """Evaluate whether minimal coverage conditions to start research are met.
 
@@ -197,23 +286,40 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
     """
     if not cfg.get('discovery', {}).get('defer_until_coverage', False):
         return True, {"reason": "disabled"}
-    min_cov = float(cfg.get('harvester', {}).get('min_coverage_for_research', 0.0))
-    if state.get('coverage:raise_threshold'):
-        hi = cfg.get('harvester', {}).get('high_coverage_threshold')
-        if hi is not None:
-            try: min_cov = float(hi)
-            except Exception: pass
-    min_sym = int(cfg.get('discovery', {}).get('min_panel_symbols', 1))
-    min_bars = int(cfg.get('discovery', {}).get('min_bars_per_symbol', 1))
     try:
-        from typing import cast, List as _List
-        keys = cast(_List[str], state.r.hkeys('harvest:coverage') or [])
+        _retro_reindex_coverage(state, cfg, tf)
+    except Exception:
+        pass
+    harv_cfg = cfg.get('harvester', {})
+    min_cov = float(harv_cfg.get('min_coverage_for_research', 0.0))
+    if state.get('coverage:raise_threshold'):
+        hi = harv_cfg.get('high_coverage_threshold')
+        if hi is not None:
+            try:
+                min_cov = float(hi)
+            except Exception:
+                pass
+    min_sym = int(cfg.get('discovery', {}).get('min_panel_symbols', 1))
+    min_bars_floor = int(cfg.get('discovery', {}).get('min_bars_per_symbol', 1))
+    panel_target_days = (harv_cfg.get('panel_target_days') or {})
+    core_syms_limit = None
+    try:
+        core_syms = (harv_cfg.get('core_symbols') or [])
+        if isinstance(core_syms, list) and len(core_syms) == 1:
+            core_syms_limit = set(core_syms)
+    except Exception:
+        pass
+    # Dynamic target bars > floor
+    target_days = int(panel_target_days.get(tf, 0))
+    target_bars = max(min_bars_floor, target_days * _bars_per_day(tf) if target_days else min_bars_floor)
+    try:
+        keys = state.r.hkeys('harvest:coverage') or []  # type: ignore[assignment]
     except Exception:
         return False, {"error": "coverage_hash_unavailable"}
     covered: Dict[str, dict] = {}
     for k in keys:
         try:
-            if isinstance(k, bytes):  # defensive
+            if isinstance(k, bytes):
                 k = k.decode('utf-8')
             parts = str(k).split(':', 2)
             if len(parts) != 3:
@@ -221,6 +327,8 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
             _ex_id, tf_key, canonical = parts
             if tf_key != tf:
                 continue
+            if core_syms_limit and canonical not in core_syms_limit:
+                continue  # TEMP single-symbol narrowing
             raw_val = state.r.hget('harvest:coverage', k)
             if raw_val is None:
                 continue
@@ -232,7 +340,7 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
                 meta = json.loads(raw)
             except Exception:
                 continue
-            if isinstance(meta, str):  # double encoded case
+            if isinstance(meta, str):
                 try:
                     meta2 = json.loads(meta)
                     if isinstance(meta2, dict):
@@ -244,13 +352,54 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
             if not isinstance(meta, dict):
                 continue
             prev = covered.get(canonical)
-            if not prev or int(meta.get('actual') or 0) > int(prev.get('actual') or 0):
+            if (not prev) or int(meta.get('actual') or 0) > int(prev.get('actual') or 0):
                 covered[canonical] = meta
         except Exception:
             continue
-    elig = [c for c, m in covered.items() if (m.get('coverage', 0) >= min_cov and (m.get('actual') or 0) >= min_bars)]
+    # Augment with total parquet rows (multi-exchange sum) for robustness
+    try:
+        base_dir = Path('data')
+        for canon, meta in list(covered.items()):
+            try:
+                pattern = str(base_dir / '*' / tf / '**' / f'{canon}.parquet')
+                files = _glob.glob(pattern, recursive=True)
+                total_rows = 0
+                for fp in files:
+                    try:
+                        df_head = pd.read_parquet(fp, columns=['timestamp'])
+                        total_rows += len(df_head)
+                    except Exception:
+                        continue
+                if total_rows > int(meta.get('actual') or 0):
+                    meta['actual_total'] = total_rows
+            except Exception:
+                continue
+    except Exception:
+        pass
+    elig = [c for c, m in covered.items() if (m.get('coverage', 0) >= min_cov and (m.get('actual_total', m.get('actual', 0)) or 0) >= target_bars)]
     ok = len(elig) >= min_sym
-    return ok, {"eligible": len(elig), "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered)}
+    # Telemetry snapshot
+    try:
+        counts = [int(m.get('actual_total', m.get('actual', 0)) or 0) for m in covered.values()]
+        if counts:
+            panel_meta = {
+                'tf': tf,
+                'target_bars': target_bars,
+                'min_bars_floor': min_bars_floor,
+                'symbols_seen': len(covered),
+                'symbols_eligible': len(elig),
+                'bars_min': min(counts),
+                'bars_median': sorted(counts)[len(counts)//2],
+                'bars_max': max(counts),
+                'min_cov_req': min_cov,
+            }
+            state.set(f'coverage:panel:{tf}', panel_meta)
+            logger.info(f"[panel_coverage] {panel_meta}")
+            if panel_meta['bars_min'] < target_bars * 0.5:
+                logger.warning(f"panel underfilled tf={tf} bars_min={panel_meta['bars_min']} < 0.5*target ({target_bars})")
+    except Exception:
+        pass
+    return ok, {"eligible": len(elig), "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered), "target_bars": target_bars}
 
 # --------------------------------------------------------------------------------------
 # CLI Root

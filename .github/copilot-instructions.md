@@ -69,4 +69,46 @@ BEHAVIOR:
 - Do not fabricate or hallucinate historical returns or performance results – all results must come from actual backtests or simulations.
 - Only propose strategies (“alphas”) that pass the strict DSR/FDR/PBO validation gates and meet all risk criteria.
 - Only suggest features and signals that have a plausible causal/structural justification (avoid purely technical coincidences with no real market driver).
----
+
+## Module Inventory (High‑Impact Roles Toward Prime Directive)
+
+| File | Role (single, outcome‑driven sentence) |
+|------|----------------------------------------|
+| v26meme/core/dsl.py | Canonical `Alpha` contract binding formula → universe → lane → realized performance for accountable promotion & risk sizing. |
+| v26meme/core/state.py | Deterministic Redis state layer (telemetry, checkpoints, alphas) enabling adaptive, reproducible loops. |
+| v26meme/data/harvester.py | Event‑sourced OHLCV ingestion with QA gates & checkpoints so only PIT‑clean history fuels discovery. |
+| v26meme/data/lakehouse.py | Partitioned Parquet store (drops open bars) giving fast, PIT‑correct feature replay. |
+| v26meme/data/quality.py | Fails closed on schema/gaps/monotonicity preventing silent data corruption & lookahead bleed. |
+| v26meme/data/checkpoints.py | Per (exchange,symbol,tf) last_ts for resumable, rate‑safe harvesting. |
+| v26meme/data/universe_screener.py | Liquidity/spread/impact filter forming a tradable, cost‑robust universe. |
+| v26meme/data/screener_store.py | Snapshot persistence for auditable universe & deterministic replays. |
+| v26meme/data/token_bucket.py | Venue rate limiter enforcing regulatory & quota safety without stalling research. |
+| v26meme/data/top_gainers.py | Momentum pulse feeder accelerating moonshot coverage for fresh edge density. |
+| v26meme/data/usd_fx.py | USD & stablecoin parity normalization eliminating fake PnL from quote drift. |
+| v26meme/data/asset_registry.py | Central asset traits (base/quote/class) enabling future factor & risk enrichment. |
+| v26meme/data/maintenance.py | Lakehouse housekeeping & retention to keep IO lean and costs bounded. |
+| v26meme/registry/resolver.py | Raw venue → canonical symbol resolver preventing mismatched joins & data divergence. |
+| v26meme/registry/catalog.py | In‑memory + persisted market catalog powering resolver & screener decisions. |
+| v26meme/registry/canonical.py | Canonical symbol construction (BASE_QUOTE_KIND) ensuring identity stability. |
+| v26meme/registry/venues.py | Static venue alias/fallback map bootstrapping reliable symbol coverage. |
+| v26meme/research/feature_factory.py | Causal, lagged feature builder (returns, vol, momentum, cross‑asset beta) with strict PIT shifts. |
+| v26meme/research/generator.py | Adaptive genetic boolean formula search sampling empirical feature quantiles to reduce degeneracy. |
+| v26meme/research/validation.py | Purged/CPCV CV + BH‑FDR + DSR filters crushing false positives before capital allocation. |
+| v26meme/research/feature_prober.py | Robustness perturbation prober exposing fragile over‑tuned predicates pre‑promotion. |
+| v26meme/labs/hyper_lab.py | Extreme Iteration Layer: high‑throughput hypothesis grinder with rejection & continuity telemetry + auto‑tuning. |
+| v26meme/labs/simlab.py | Fee/slippage‑aware backtester producing realistic trade return streams for CV & gates. |
+| v26meme/labs/screener_replay.py | Deterministic screener snapshot replay for audit & regression. |
+| v26meme/allocation/optimizer.py | Inverse‑variance + constraint optimizer maximizing risk‑adjusted compounding under caps. |
+| v26meme/allocation/lanes.py | Lane budget EWMA & probation/retag logic enforcing disciplined capital migration. |
+| v26meme/execution/exchange.py | Safe exchange abstraction (paper) isolating venue quirks & preventing accidental live trades. |
+| v26meme/execution/handler.py | Target weight reconciliation simulating fills & producing realized PnL traces. |
+| v26meme/execution/risk.py | Kill switches, stops, equity floors & order caps enforcing anti‑ruin invariants. |
+| v26meme/execution/micro_live.py | Lightweight slippage probes calibrating simulation cost assumptions. |
+| v26meme/llm/proposer.py | OpenAI JSON‑hardened strategy suggester (schema clamp, suppression aware) injecting novel hypotheses safely. |
+| v26meme/analytics/adaptive.py | Publishes adaptive knob adjustments (population size, risk limits) from telemetry feedback loops. |
+| v26meme/cli.py | Orchestrator loop chaining harvest → discovery → validation → promotion → allocation → risk → execution. |
+| dashboard/app.py | Operator dashboard surfacing equity, risk rails, alpha set health. |
+| dashboard/hyper_lab_app.py | EIL telemetry console (survivors, rejections, continuity, hygiene). |
+| tests/* | Deterministic PIT, data QA, CV/FDR, risk & proposer guardrail enforcement suite. |
+
+> Copilot: When altering strategy, symbol, or feature logic, leverage these modules instead of re‑creating functionality; add config knobs (no magic numbers) and update tests for PIT correctness.

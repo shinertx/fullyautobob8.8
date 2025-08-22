@@ -113,6 +113,75 @@ with st.expander("Top 5 Formulas"):
     for rrow in rows[:5]:
         st.code(rrow.get("formula"), language="text")
 
+# Telemetry panels
+st.header("Telemetry")
+rej_counts_raw = r.get('eil:rej:counts')
+if rej_counts_raw:
+    try:
+        rc = json.loads(rej_counts_raw) if isinstance(rej_counts_raw, str) else rej_counts_raw
+    except Exception:
+        rc = {}
+    st.subheader("Rejection Counts")
+    st.json(rc)
+    dominant = r.get('eil:rej:dominant')
+    if dominant:
+        st.write(f"Dominant rejection: {dominant}")
+    ccols = st.columns(4)
+    sample_size = 8  # default display limit
+    for reason in ['pval','dsr','trades','sortino','sharpe','win_rate','mdd']:
+        samples_raw = r.get(f'eil:rej:samples:{reason}')
+        if not samples_raw:
+            continue
+        try:
+            if isinstance(samples_raw, (bytes, bytearray)):
+                samples_raw = samples_raw.decode('utf-8','ignore')
+            sm = json.loads(samples_raw) if isinstance(samples_raw, str) else []
+            sm = [str(x) for x in sm][:sample_size] if (sm and isinstance(sm, list)) else []  # sample_size from config optional
+        except Exception:
+            sm = []
+        if sm:
+            ccols[0].markdown("**{} samples**: {}".format(reason, ', '.join(sm)))
+
+feat_gate_raw = r.get('eil:feature_gate_diag')
+feat_stats_raw = r.get('eil:feature_stats')
+cont_raw = r.get('eil:feature_continuity')
+if feat_gate_raw and feat_stats_raw:
+    try:
+        if isinstance(feat_gate_raw,(bytes,bytearray)): feat_gate_raw = feat_gate_raw.decode('utf-8','ignore')
+        if isinstance(feat_stats_raw,(bytes,bytearray)): feat_stats_raw = feat_stats_raw.decode('utf-8','ignore')
+        if isinstance(cont_raw,(bytes,bytearray)): cont_raw = cont_raw.decode('utf-8','ignore')
+        gate = json.loads(feat_gate_raw) if isinstance(feat_gate_raw,str) else {}
+        stats = json.loads(feat_stats_raw) if isinstance(feat_stats_raw,str) else {}
+        cont_ratios = json.loads(cont_raw) if isinstance(cont_raw,str) else {}
+    except Exception:
+        gate, stats, cont_ratios = {}, {}, {}
+    st.subheader("Feature Gating & Continuity")
+    rows_fg = []
+    for fname, meta in stats.items():
+        rows_fg.append({
+            'feature': fname,
+            'keep': gate.get(fname, {}).get('keep', False),
+            'q_low': meta.get('q_low'),
+            'q_high': meta.get('q_high'),
+            'continuity': cont_ratios.get(fname, 0.0),
+            'min': meta.get('min'),
+            'max': meta.get('max')
+        })
+    if rows_fg:
+        st.dataframe(pd.DataFrame(rows_fg), use_container_width=True)
+
+pop_hyg_raw = r.get('eil:population_hygiene')
+if pop_hyg_raw:
+    try:
+        if isinstance(pop_hyg_raw,(bytes,bytearray)):
+            pop_hyg_raw = pop_hyg_raw.decode('utf-8','ignore')
+        ph = json.loads(pop_hyg_raw) if isinstance(pop_hyg_raw,str) else {}
+        if ph:
+            st.subheader("Population Hygiene")
+            st.json(ph)
+    except Exception:
+        pass
+
 st.caption("Auto-refresh every 15s")
 _time = st.empty()
 for i in range(15, 0, -1):

@@ -23,34 +23,77 @@ It evolves like a quant hedge fund in a box:
 ## 📂 File Tree
 
 ```
-v26meme/
+fullyautobob8.8/
 ├── configs/
-│   ├── config.yaml            # System, discovery, portfolio, risk, feeds
-│   └── symbols.yaml           # Canonical exchange symbol registry
+│   ├── config.yaml
+│   └── symbols.yaml
 ├── v26meme/
-│   ├── cli.py                 # Main loop (discovery → validation → promotion → execution)
-│   ├── core/                  # State & DSL
-│   ├── data/                  # Lakehouse, screener, registry, harvester
-│   ├── feeds/                 # CryptoPanic, OnChain, Orderflow
-│   ├── research/              # Feature factory, generator, validation, prober
-│   ├── labs/                  # SimLab, Hyper-Lab (EIL), Screener replay
-│   ├── allocation/            # Portfolio optimizer
-│   ├── execution/             # Exchange, risk, handler, micro-live
-│   ├── llm/                   # OpenAI proposer (hard JSON guardrails)
-│   └── analytics/             # Adaptive knobs, telemetry
+│   ├── __init__.py
+│   ├── cli.py
+│   ├── core/
+│   │   ├── dsl.py
+│   │   └── state.py
+│   ├── data/
+│   │   ├── harvester.py
+│   │   ├── lakehouse.py
+│   │   ├── quality.py
+│   │   ├── checkpoints.py
+│   │   ├── universe_screener.py
+│   │   ├── screener_store.py
+│   │   ├── token_bucket.py
+│   │   ├── top_gainers.py
+│   │   ├── usd_fx.py
+│   │   ├── asset_registry.py
+│   │   └── maintenance.py
+│   ├── registry/
+│   │   ├── canonical.py
+│   │   ├── catalog.py
+│   │   ├── resolver.py
+│   │   └── venues.py
+│   ├── research/
+│   │   ├── feature_factory.py
+│   │   ├── generator.py
+│   │   ├── validation.py
+│   │   └── feature_prober.py
+│   ├── labs/
+│   │   ├── hyper_lab.py
+│   │   ├── simlab.py
+│   │   └── screener_replay.py
+│   ├── allocation/
+│   │   ├── optimizer.py
+│   │   └── lanes.py
+│   ├── execution/
+│   │   ├── exchange.py
+│   │   ├── handler.py
+│   │   ├── risk.py
+│   │   └── micro_live.py
+│   ├── llm/
+│   │   └── proposer.py
+│   └── analytics/
+│       └── adaptive.py
 ├── dashboard/
-│   └── app.py                 # Streamlit dashboard (equity, risk, alpha tables)
+│   ├── app.py
+│   └── hyper_lab_app.py
 ├── tests/
-│   └── data/                  # Harvester QA, checkpointing, canonical joins
-├── install_and_launch_v475.sh # One-command installer/launcher (tmux sessions)
-├── data_harvester.py          # Adaptive, event-sourced harvester
-├── requirements.txt           # Pinned deps for reproducibility
-├── pyproject.toml             # Metadata
-├── README.md                  # (this file)
-└── .github/
-    ├── copilot-instructions.md # Custom Copilot guardrails
-    └── prompts/                # Task-specific Copilot prompts
+│   ├── data/
+│   ├── research/
+│   ├── labs/
+│   ├── llm/
+│   ├── registry/
+│   └── execution/
+├── .github/
+│   ├── copilot-instructions.md
+│   └── prompts/
+├── data_harvester.py
+├── install_and_launch_v475.sh
+├── migration-notes.md
+├── requirements.txt
+├── pyproject.toml
+├── README.md
+└── pytest.ini
 ```
+
+> See Copilot instructions for high‑impact role of each module (Prime Directive alignment).
 
 ---
 
@@ -153,6 +196,47 @@ NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `pyt
 
 ---
 
+## 🔍 EIL Telemetry & Adaptive Search (2025-08-20)
+
+New observability & adaptation layer added to Hyper Lab (Extreme Iteration Layer):
+
+Telemetry Keys:
+- `eil:rej:counts` / `eil:rej:samples:<reason>` — first-failing gate rejection distribution (pval, dsr, trades, sortino, sharpe, win_rate, mdd) + sampled FIDs.
+- `eil:feature_gate_diag`, `eil:feature_stats` — per-cycle feature gating & empirical quantiles.
+- `eil:feature_continuity`, `eil:continuity_suppress` — rolling continuity ratios & features suppressed after patience threshold.
+- `eil:population_hygiene` — summary of suppressed features & partial reseed actions.
+- `eil:rej:dominant` — dominant rejection reason (if any) crossing alert ratio.
+- `adaptive:population_size` — current auto-tuned genetic population size.
+
+Adaptive Mechanics:
+- Partial reseed of formulas referencing suppressed or low-continuity features (`discovery.reseed_fraction`).
+- Fitness penalties: drawdown (`fitness_drawdown_penalty_scale`), concentration (`fitness_concentration_penalty_scale`), variance (`fitness_variance_penalty_scale`).
+- Auto-tuning: if p-value rejections dominate (≥ `adaptive.rejection_pval_high_ratio`), population size increments by `adaptive.population_step` (bounded by `adaptive.population_size_max`).
+- Correlation fallback feature `beta_btc_20p` (rolling lagged OLS beta vs BTC) inserted when correlation sparse; maintains cross-asset structural signal channel.
+
+Configuration Additions:
+```yaml
+discovery:
+  rejection_sample_size: 8
+  rejection_alert_ratio: 0.70
+  fitness_concentration_penalty_scale: 0.25
+  fitness_variance_penalty_scale: 0.15
+  reseed_fraction: 0.30
+  fitness_drawdown_penalty_scale: 0.40
+  adaptive:
+    continuity_suppression_patience: 5
+    tuning_enabled: true
+    rejection_pval_high_ratio: 0.75
+    population_step: 40
+```
+
+Use Cases:
+- Rapidly identify dominant bottleneck (e.g. 80% p-value rejections → expand population / widen feature spans; trade count rejections → lower min_trades or extend window).
+- Monitor feature stability over time; continuity < threshold triggers suppression limiting overfitting to sporadic artifacts.
+- Preserve diversity & structural insight when primary correlation feature underpopulated via beta fallback.
+
+---
+
 ## 🧪 Tests
 
 Run:
@@ -205,40 +289,3 @@ Covers:
 
 ✅ **Ready to run, black-box autonomous quant.**  
 📈 Compounding scoreboard = $200 → $1M in 30 days.
-
-fullyautobob8.8/
-├─ .github/
-│  ├─ copilot-instructions.md
-│  └─ prompts/
-├─ .vscode/
-├─ configs/
-│  ├─ config.yaml
-│  └─ symbols.yaml
-├─ dashboard/
-│  └─ app.py
-├─ v26meme.egg-info/
-├─ v26meme/
-│  ├─ cli.py                  # main loop orchestrator
-│  ├─ core/                   # state & DSL
-│  ├─ data/                   # lakehouse, screener, registry, harvester, QA, etc.
-│  ├─ feeds/                  # cryptopanic, onchain, orderflow
-│  ├─ research/               # feature factory, generator, validation, prober
-│  ├─ labs/                   # simlab, hyper_lab (EIL), screener_replay
-│  ├─ allocation/             # portfolio optimizer, lane budgets
-│  ├─ execution/              # exchange, risk, handler, micro-live
-│  ├─ llm/                    # OpenAI proposer
-│  └─ analytics/              # adaptive knobs, telemetry
-├─ tests/
-│  └─ data/
-├─ .env.example
-├─ .gitignore
-├─ README.md
-├─ data_harvester.py
-├─ install_and_launch_v475.sh
-├─ loop_err.log
-├─ pyproject.toml
-├─ pytest.ini
-└─ requirements.txt
-
-
----
