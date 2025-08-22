@@ -14,6 +14,7 @@ from v26meme.research.generator import GeneticGenerator  # updated: adaptive gen
 from v26meme.labs.simlab import SimLab
 from v26meme.research.validation import panel_cv_stats, deflated_sharpe_ratio, benjamini_hochberg
 from typing import List, Dict, Tuple, Any
+from math import comb  # NEW: for binomial test fallback
 
 # NEW: helper to apply single-symbol restriction
 def _maybe_restrict_single_symbol(cfg: dict, symbols: List[str]) -> List[str]:
@@ -428,6 +429,30 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> None:
                         continue
                     cv_res = panel_cv_stats(panel_returns, k_folds=cv_folds, embargo=cv_embargo, alpha_fdr=fdr_alpha, cv_method=cfg['discovery'].get('cv_method','kfold'))
                     p_val = float(cv_res.get('p_value', 1.0))
+                    # Sparse-trade binomial fallback (PIT-safe; uses realized trade outcomes only)
+                    sparse_cfg = cfg.get('validation', {}).get('sparse_trades', {})
+                    if sparse_cfg.get('enabled', False):
+                        winrate_p_threshold_trades = int(sparse_cfg.get('winrate_p_threshold_trades', 25))
+                        # pooled trade outcomes
+                        total_trades_all = 0
+                        wins = 0
+                        for ser in panel_returns.values():
+                            total_trades_all += ser.shape[0]
+                            wins += int((ser > 0).sum())
+                        if total_trades_all > 0 and total_trades_all < winrate_p_threshold_trades and p_val >= 0.95:
+                            # Two-sided binomial test vs p=0.5
+                            # Compute cumulative probability of >= wins or <= wins depending on side; exact test (small n)
+                            p = 0.5
+                            prob = 0.0
+                            # two-sided: sum probabilities as extreme or more
+                            # Compute probability mass for all counts
+                            pmf = [comb(total_trades_all, k) * (p**k) * ((1-p)**(total_trades_all-k)) for k in range(total_trades_all+1)]
+                            # Observed deviation
+                            dev = abs(wins - total_trades_all * p)
+                            for k, mass in enumerate(pmf):
+                                if abs(k - total_trades_all * p) >= dev:
+                                    prob += mass
+                            p_val = min(p_val, prob)
                     mean_oos = float(cv_res.get('mean_oos', 0.0))
                     dsr_prob = 0.0
                     agg_win_rate = 0.0
@@ -491,23 +516,13 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> None:
                     # Trade diversity signal (rewards more trades, with diminishing returns)
                     trade_signal = np.log1p(total_trades)
 
-                    # Combine signals with weights
+                    # Combine signals with weights (+ activation gain modulation)
                     fitness_weights = cfg['discovery'].get('fitness_weights', {'profit_signal': 0.7, 'trade_signal': 0.3})
                     w_profit = fitness_weights.get('profit_signal', 0.7)
                     w_trade = fitness_weights.get('trade_signal', 0.3)
-
-                                        # Raw profitability signal (gated to be non-negative)
-                    profit_signal = max(0.0, agg_sortino)
-
-                    # Trade diversity signal (rewards more trades, with diminishing returns)
-                    trade_signal = np.log1p(total_trades)
-
-                    # Combine signals with weights
-                    fitness_weights = cfg['discovery'].get('fitness_weights', {'profit_signal': 0.7, 'trade_signal': 0.3})
-                    w_profit = fitness_weights.get('profit_signal', 0.7)
-                    w_trade = fitness_weights.get('trade_signal', 0.3)
-
-                    fitness = (w_profit * profit_signal) + (w_trade * trade_signal)
+                    activation_weight = float(cfg['discovery'].get('fitness_activation_weight', 0.5))
+                    base_fitness = (w_profit * profit_signal) + (w_trade * trade_signal)
+                    fitness = base_fitness * ( (1.0 - activation_weight) + activation_weight * activation_gain )
                     fitness *= dd_pen * conc_pen * var_pen # Apply existing penalties
                     fitness_scores[fid] = fitness
                     formula_stats[fid] = {

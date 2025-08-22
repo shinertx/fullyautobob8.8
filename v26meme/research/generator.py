@@ -4,7 +4,8 @@ from typing import List, Dict, Optional, Tuple
 class GeneticGenerator:
     def __init__(self, features: List[str], population_size: int, seed: int = 1337,
                  feature_stats: Optional[Dict[str, Dict[str, float]]] = None,
-                 quantile_low: float = 0.10, quantile_high: float = 0.90):
+                 quantile_low: float = 0.10, quantile_high: float = 0.90,
+                 max_formula_depth: int = 2, depth3_prob: float = 0.0):
         """Genetic boolean formula generator (adaptive threshold domain).
 
         PIT: All randomness seeded; uses only historical *feature_stats* passed in (empirical
@@ -25,6 +26,10 @@ class GeneticGenerator:
         quantile_low / quantile_high : float
             Adaptive quantile bounds (configurable knobs, no magic numbers) used when feature_stats
             present. Default 10%–90% band encourages mid-distribution variance (reduces constant predicates).
+        max_formula_depth : int
+            Maximum recursive boolean tree depth (>=2). Raising depth increases interaction space.
+        depth3_prob : float
+            Probability of sampling depth=max_formula_depth (allows controlled deeper exploration without exploding search space).
         """
         self.features = features
         self.operators = ['>', '<']
@@ -40,6 +45,8 @@ class GeneticGenerator:
         self.feature_stats = feature_stats or {}
         self.q_low = quantile_low
         self.q_high = quantile_high
+        self.max_formula_depth = max(2, int(max_formula_depth))
+        self.depth3_prob = max(0.0, min(1.0, depth3_prob))
         random.seed(seed)
 
     def set_feature_stats(self, feature_stats: Dict[str, Dict[str, float]]) -> None:
@@ -69,6 +76,9 @@ class GeneticGenerator:
         return [feat, random.choice(self.operators), self._sample_threshold(feat)]
 
     def _create_random_formula(self, max_depth=2):
+        # Allow deeper trees based on configured probability (depth3_prob) and max_formula_depth
+        if max_depth == 2 and self.max_formula_depth >= 3 and random.random() < self.depth3_prob:
+            max_depth = self.max_formula_depth
         if max_depth <= 0 or random.random() > 0.5:
             return self._create_random_condition()
         return [self._create_random_formula(max_depth-1), random.choice(self.logical_ops), self._create_random_formula(max_depth-1)]

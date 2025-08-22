@@ -26,7 +26,6 @@ It evolves like a quant hedge fund in a box:
 fullyautobob8.8/
 ├── configs/
 │   ├── config.yaml
-│   └── symbols.yaml
 ├── v26meme/
 │   ├── __init__.py
 │   ├── cli.py
