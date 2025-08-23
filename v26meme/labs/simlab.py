@@ -1,4 +1,6 @@
 import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple, Any
 
 def _evaluate_formula(row, formula):
     if not isinstance(formula[0], list):
@@ -40,7 +42,7 @@ class SimLab:
         bps = float(self.slip_table.get(display, 0.0))
         return max(self.slippage, bps/10000.0)
 
-    def run_backtest(self, df: pd.DataFrame, formula: list) -> dict:
+    def run_backtest(self, df: pd.DataFrame, formula: list, bidirectional: bool = False, time_stop_bars: int | None = None) -> dict:
         if df.empty or len(df) < 60: return {}
         df = df.copy()
         display = df.attrs.get("display", None)
@@ -51,23 +53,47 @@ class SimLab:
             edges = edges.astype(int)
         except Exception:
             edges = edges.apply(lambda x: 1 if x>0 else (-1 if x<0 else 0))
-        in_trade, entry_price, entry_idx = False, 0.0, 0
+        in_trade, entry_price, entry_idx, direction = False, 0.0, 0, 1
         trades = []
-        hold_lengths = []
+        hold_lengths: List[int] = []
         for i in range(len(df)):
             force_exit = False
             if in_trade and self.max_holding_bars is not None and (i - entry_idx) >= self.max_holding_bars:
                 force_exit = True
+            if in_trade and time_stop_bars is not None and (i - entry_idx) >= time_stop_bars:
+                force_exit = True
+            # entry conditions
             if edges.iloc[i] > 0 and not in_trade:
-                in_trade, entry_price, entry_idx = True, df['close'].iloc[i] * (1 + slip), i
-            elif (edges.iloc[i] < 0 or force_exit) and in_trade:
-                in_trade = False
-                exit_price = df['close'].iloc[i] * (1 - slip)
-                trades.append(((exit_price-entry_price)/entry_price) - (2*self.fee))
+                in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 + slip), i, 1
+            elif bidirectional and edges.iloc[i] < 0 and not in_trade:
+                in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 - slip), i, -1
+            # exit / flip
+            elif in_trade and ((edges.iloc[i] < 0 and direction == 1) or (edges.iloc[i] > 0 and direction == -1) or force_exit):
+                exit_px_raw = df['close'].iloc[i]
+                if direction == 1:
+                    exit_price = exit_px_raw * (1 - slip)
+                    pnl = ((exit_price - entry_price) / entry_price) - (2 * self.fee)
+                else:  # short
+                    exit_price = exit_px_raw * (1 + slip)
+                    pnl = ((entry_price - exit_price) / entry_price) - (2 * self.fee)
+                trades.append(pnl)
                 hold_lengths.append(i - entry_idx)
+                in_trade = False
+                # optional immediate flip if bidirectional and opposite signal edge present
+                if bidirectional and not force_exit:
+                    if edges.iloc[i] > 0 and direction == -1:
+                        in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 + slip), i, 1
+                    elif edges.iloc[i] < 0 and direction == 1:
+                        in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 - slip), i, -1
         if in_trade:
-            exit_price = df['close'].iloc[-1] * (1 - slip)
-            trades.append(((exit_price-entry_price)/entry_price) - (2*self.fee))
+            exit_px_raw = df['close'].iloc[-1]
+            if direction == 1:
+                exit_price = exit_px_raw * (1 - slip)
+                pnl = ((exit_price - entry_price) / entry_price) - (2 * self.fee)
+            else:
+                exit_price = exit_px_raw * (1 + slip)
+                pnl = ((entry_price - exit_price) / entry_price) - (2 * self.fee)
+            trades.append(pnl)
             hold_lengths.append(len(df) - entry_idx)
         if not trades: return {"all": {"n_trades": 0}}
         ser = pd.Series(trades)
@@ -75,3 +101,15 @@ class SimLab:
         stats['median_hold'] = float(pd.Series(hold_lengths).median()) if hold_lengths else 0.0
         stats['avg_hold'] = float(pd.Series(hold_lengths).mean()) if hold_lengths else 0.0
         return {"all": stats}
+
+    def run_panel(self, dfs: Dict[str, pd.DataFrame], formula: list, **kw) -> Dict[str, dict]:
+        """Vectorized-style panel evaluation returning per-symbol stats.
+
+        PIT: Each symbol evaluated independently on closed bars only.
+        """
+        out: Dict[str, dict] = {}
+        for sym, dff in dfs.items():
+            res = self.run_backtest(dff, formula, **kw).get('all', {})
+            if res:
+                out[sym] = res
+        return out
