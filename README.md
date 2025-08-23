@@ -23,34 +23,76 @@ It evolves like a quant hedge fund in a box:
 ## 📂 File Tree
 
 ```
-v26meme/
+fullyautobob8.8/
 ├── configs/
-│   ├── config.yaml            # System, discovery, portfolio, risk, feeds
-│   └── symbols.yaml           # Canonical exchange symbol registry
+│   ├── config.yaml
 ├── v26meme/
-│   ├── cli.py                 # Main loop (discovery → validation → promotion → execution)
-│   ├── core/                  # State & DSL
-│   ├── data/                  # Lakehouse, screener, registry, harvester
-│   ├── feeds/                 # CryptoPanic, OnChain, Orderflow
-│   ├── research/              # Feature factory, generator, validation, prober
-│   ├── labs/                  # SimLab, Hyper-Lab (EIL), Screener replay
-│   ├── allocation/            # Portfolio optimizer
-│   ├── execution/             # Exchange, risk, handler, micro-live
-│   ├── llm/                   # OpenAI proposer (hard JSON guardrails)
-│   └── analytics/             # Adaptive knobs, telemetry
+│   ├── __init__.py
+│   ├── cli.py
+│   ├── core/
+│   │   ├── dsl.py
+│   │   └── state.py
+│   ├── data/
+│   │   ├── harvester.py
+│   │   ├── lakehouse.py
+│   │   ├── quality.py
+│   │   ├── checkpoints.py
+│   │   ├── universe_screener.py
+│   │   ├── screener_store.py
+│   │   ├── token_bucket.py
+│   │   ├── top_gainers.py
+│   │   ├── usd_fx.py
+│   │   ├── asset_registry.py
+│   │   └── maintenance.py
+│   ├── registry/
+│   │   ├── canonical.py
+│   │   ├── catalog.py
+│   │   ├── resolver.py
+│   │   └── venues.py
+│   ├── research/
+│   │   ├── feature_factory.py
+│   │   ├── generator.py
+│   │   ├── validation.py
+│   │   └── feature_prober.py
+│   ├── labs/
+│   │   ├── hyper_lab.py
+│   │   ├── simlab.py
+│   │   └── screener_replay.py
+│   ├── allocation/
+│   │   ├── optimizer.py
+│   │   └── lanes.py
+│   ├── execution/
+│   │   ├── exchange.py
+│   │   ├── handler.py
+│   │   ├── risk.py
+│   │   └── micro_live.py
+│   ├── llm/
+│   │   └── proposer.py
+│   └── analytics/
+│       └── adaptive.py
 ├── dashboard/
-│   └── app.py                 # Streamlit dashboard (equity, risk, alpha tables)
+│   ├── app.py
+│   └── hyper_lab_app.py
 ├── tests/
-│   └── data/                  # Harvester QA, checkpointing, canonical joins
-├── install_and_launch_v475.sh # One-command installer/launcher (tmux sessions)
-├── data_harvester.py          # Adaptive, event-sourced harvester
-├── requirements.txt           # Pinned deps for reproducibility
-├── pyproject.toml             # Metadata
-├── README.md                  # (this file)
-└── .github/
-    ├── copilot-instructions.md # Custom Copilot guardrails
-    └── prompts/                # Task-specific Copilot prompts
+│   ├── data/
+│   ├── research/
+│   ├── labs/
+│   ├── llm/
+│   ├── registry/
+│   └── execution/
+├── .github/
+│   ├── copilot-instructions.md
+│   └── prompts/
+├── data_harvester.py
+├── install_and_launch_v475.sh
+├── migration-notes.md
+├── requirements.txt
+├── pyproject.toml
+├── README.md
+└── pytest.ini
 ```
+
+> See Copilot instructions for high‑impact role of each module (Prime Directive alignment).
 
 ---
 
@@ -78,7 +120,20 @@ cd v26meme
 ./install_and_launch_v475.sh
 ```
 
+> NOTE: Environments without a `python` shim now automatically detect `python3` in the launcher script. If invoking manually, use:
+>
+> ```bash
+> python3 -m v26meme.cli loop
+> ```
+
+NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `python3` explicitly (all examples below updated).
+
 **Dependencies pinned** in `requirements.txt`.  
+**Dashboards / Labs:**
+- Dashboard: http://localhost:8601 (Streamlit GUI)
+- Hyper Lab Dashboard: http://localhost:8610 (EIL survivors & metrics)
+- Hyper Lab (headless batch EIL) reserved port env: HYPER_LAB_PORT=8610 (no HTTP server yet; future UI can bind here)
+
 **Dashboard:** http://localhost:8601
 
 ---
@@ -106,6 +161,14 @@ cd v26meme
 
 ## 🔄 Recent Enhancements
 
++ **Alpha Registry Hygiene (2025-08-19):** Automatic per-cycle maintenance now cleans `active_alphas` by (1) removing duplicate ids (order-preserving), (2) trimming trailing zero-return padding beyond recorded `n_trades` (up to `discovery.max_return_padding_trim`, default 5) to prevent correlation / variance skew, and (3) optionally retro-enforcing current promotion gates when `discovery.enforce_current_gates_on_start=true`. A single JSON log line `[hygiene] {...}` summarizes actions (dupes_removed, trimmed, dropped_gates, final). Disable retro enforcement by leaving the flag false (default) to avoid sudden portfolio contraction.
++ **Fast Bootstrap Pipeline (2025-08-19):** Added `harvester.bootstrap_mode: parallel` (placeholder worker hook) to allow deep backfill to execute out-of-band while the main loop begins discovery on shallow data.
++ **Partial Harvest Timeframe Rotation:** `harvester.partial_harvest: true` processes only one timeframe per loop cycle (round‑robin) to reach minimal research coverage faster (e.g. fill `1h` before grinding lower granularities). State key `harvest:partial:tf_index` tracks rotation.
++ **Coverage Gate & Escalation:** Research is deferred until at least `discovery.min_panel_symbols` symbols have both (a) >= `harvester.min_coverage_for_research` coverage ratio and (b) >= `discovery.min_bars_per_symbol` bars on the research timeframe (default 1h). After the first promotion, threshold escalates to `harvester.high_coverage_threshold` (flag `coverage:raise_threshold`). Gate can be disabled via `discovery.defer_until_coverage: false`.
++ **Priority Symbols:** `harvester.priority_symbols` harvested first each cycle to seed flagship bases (BTC, ETH, SOL by default) ensuring early panel viability and adaptive knob calculation.
++ **Promotion Threshold Buffer Escalation:** First successful promotion sets a state flag raising the coverage requirement to accelerate depth-building before scaling additional alphas.
++ **Expanded Config Knobs:** Added `discovery.min_panel_symbols`, `discovery.min_bars_per_symbol`, `harvester.min_coverage_for_research`, `harvester.high_coverage_threshold`, and lane smoothing parameters (`lanes.smoothing_alpha`, `lanes.dead_band`, `lanes.max_step_per_cycle`, probation & retag blocks) — all adaptive & testable.
+
 * **Deflated Sharpe Gate (2025-08-19):** Activated probabilistic overfit filter (`validation.dsr.enabled=true`, `min_prob=0.60`). Strategies must clear deflated Sharpe confidence threshold after BH-FDR.
 * **On-Demand Harvest Queue:** `eil:harvest:requests` now drained each cycle; queued canonicals are force-included in the harvester plan (all configured timeframes) for next ingestion.
 * **Screener Canonical Alignment:** Screener now sets `market_id` to canonical (e.g. `BTC_USD_SPOT`) and preserves raw venue symbol as `venue_symbol` for impact calculation and API calls; ensures downstream joins are consistent with Lakehouse.
@@ -115,6 +178,7 @@ cd v26meme
 * **Orderflow microstructure features:** The screener now injects order-book metrics (bid/ask imbalance, spread (bps), microprice deviation) into each instrument when `feeds.orderflow.enabled=true`. This enriches universe selection with real-time liquidity signals.
 * **Combinatorial Purged CV (CPCV):** In addition to standard purged K-fold cross-validation, you can enable CPCV (set `discovery.cv_method: "cpcv"`) to evaluate strategies across multiple train/test fold combinations for more robust fitness estimates.
 * **Candle hygiene:** The Lakehouse data loader drops the latest OHLCV bar if it’s still in an open interval, preventing partial-bar lookahead. This check parses the timeframe (e.g. 1m, 1h) and omits any not-yet-closed candle from model data.
+* **Group C (2025-08-22) Diversity & Speciation:** Added structural feature-set Jaccard clustering (`discovery.diversity.*`) with diversity fitness weight (`fitness_extras.weights.diversity`), per-cycle telemetry `eil:diag:diversity`, greedy speciation clusters, diversity bonus (1 - median Jaccard), cluster size penalty, and promotion gate requiring ≥1 (≥2 for large populations) clusters to reduce convergence and factor crowding.
 
 ## 🌐 Data & Universe
 
@@ -132,12 +196,65 @@ cd v26meme
 
 ---
 
+## 🔍 EIL Telemetry & Adaptive Search (2025-08-20)
+
+New observability & adaptation layer added to Hyper Lab (Extreme Iteration Layer):
+
+Telemetry Keys:
+- `eil:rej:counts` / `eil:rej:samples:<reason>` — first-failing gate rejection distribution (pval, dsr, trades, sortino, sharpe, win_rate, mdd) + sampled FIDs.
+- `eil:feature_gate_diag`, `eil:feature_stats` — per-cycle feature gating & empirical quantiles.
+- `eil:feature_continuity`, `eil:continuity_suppress` — rolling continuity ratios & features suppressed after patience threshold.
+- `eil:population_hygiene` — summary of suppressed features & partial reseed actions.
+- `eil:rej:dominant` — dominant rejection reason (if any) crossing alert ratio.
+- `adaptive:population_size` — current auto-tuned genetic population size.
+
+Adaptive Mechanics:
+- Partial reseed of formulas referencing suppressed or low-continuity features (`discovery.reseed_fraction`).
+- Fitness penalties: drawdown (`fitness_drawdown_penalty_scale`), concentration (`fitness_concentration_penalty_scale`), variance (`fitness_variance_penalty_scale`).
+- Auto-tuning: if p-value rejections dominate (≥ `adaptive.rejection_pval_high_ratio`), population size increments by `adaptive.population_step` (bounded by `adaptive.population_size_max`).
+- Correlation fallback feature `beta_btc_20p` (rolling lagged OLS beta vs BTC) inserted when correlation sparse; maintains cross-asset structural signal channel.
+
+Configuration Additions:
+```yaml
+discovery:
+  rejection_sample_size: 8
+  rejection_alert_ratio: 0.70
+  fitness_concentration_penalty_scale: 0.25
+  fitness_variance_penalty_scale: 0.15
+  reseed_fraction: 0.30
+  fitness_drawdown_penalty_scale: 0.40
+  adaptive:
+    continuity_suppression_patience: 5
+    tuning_enabled: true
+    rejection_pval_high_ratio: 0.75
+    population_step: 40
+```
+
+Use Cases:
+- Rapidly identify dominant bottleneck (e.g. 80% p-value rejections → expand population / widen feature spans; trade count rejections → lower min_trades or extend window).
+- Monitor feature stability over time; continuity < threshold triggers suppression limiting overfitting to sporadic artifacts.
+- Preserve diversity & structural insight when primary correlation feature underpopulated via beta fallback.
+
+---
+
 ## 🧪 Tests
 
 Run:
 
 ```bash
 pytest tests/
+```
+
+Or run the main autonomous loop directly:
+
+```bash
+python3 -m v26meme.cli loop
+```
+
+Debug the screener only:
+
+```bash
+python3 -m v26meme.cli debug_screener
 ```
 
 Covers:
@@ -172,40 +289,3 @@ Covers:
 
 ✅ **Ready to run, black-box autonomous quant.**  
 📈 Compounding scoreboard = $200 → $1M in 30 days.
-
-fullyautobob8.8/
-├─ .github/
-│  ├─ copilot-instructions.md
-│  └─ prompts/
-├─ .vscode/
-├─ configs/
-│  ├─ config.yaml
-│  └─ symbols.yaml
-├─ dashboard/
-│  └─ app.py
-├─ v26meme.egg-info/
-├─ v26meme/
-│  ├─ cli.py                  # main loop orchestrator
-│  ├─ core/                   # state & DSL
-│  ├─ data/                   # lakehouse, screener, registry, harvester, QA, etc.
-│  ├─ feeds/                  # cryptopanic, onchain, orderflow
-│  ├─ research/               # feature factory, generator, validation, prober
-│  ├─ labs/                   # simlab, hyper_lab (EIL), screener_replay
-│  ├─ allocation/             # portfolio optimizer, lane budgets
-│  ├─ execution/              # exchange, risk, handler, micro-live
-│  ├─ llm/                    # OpenAI proposer
-│  └─ analytics/              # adaptive knobs, telemetry
-├─ tests/
-│  └─ data/
-├─ .env.example
-├─ .gitignore
-├─ README.md
-├─ data_harvester.py
-├─ install_and_launch_v475.sh
-├─ loop_err.log
-├─ pyproject.toml
-├─ pytest.ini
-└─ requirements.txt
-
-
----

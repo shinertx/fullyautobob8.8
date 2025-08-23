@@ -5,89 +5,109 @@ system:
   redis_port: 6379
   seed: 1337
 
+features:
+  zscore_lookback: 200   # NEW: rolling window for lagged z-score normalization
+
 data_source:
   exchanges: ["coinbase", "kraken"]
 
 # v4.7.5 data-plane
 harvester:
-  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","AVAX_USD_SPOT","LINK_USD_SPOT",
-                 "ADA_USD_SPOT","XRP_USD_SPOT","DOGE_USD_SPOT","MATIC_USD_SPOT","DOT_USD_SPOT","EUR_USD_SPOT",
-                 "LTC_USD_SPOT","LDO_USD_SPOT","BCH_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT","FIL_USD_SPOT",
-                 "NEAR_USD_SPOT","ARB_USD_SPOT","OP_USD_SPOT","INJ_USD_SPOT","APT_USD_SPOT","XLM_USD_SPOT",
-                 "ALGO_USD_SPOT","SUI_USD_SPOT","SHIB_USD_SPOT"]
-  dynamic_enabled: true
+  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","LTC_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT"]  # MULTI: re-enable broader panel for EIL entropy
+  restrict_single_symbol: false      # DISABLE: allow multi-symbol evolutionary panel
+  dynamic_enabled: false            # TEMP: freeze universe expansion
   timeframes_by_lane:
-    core:     ["1m","5m","15m","1h","4h","1d"]
-    moonshot: ["1m","5m","15m"]
-    eil:      "on_demand"
-  quotas:
-    coinbase: { max_requests_per_min: 60, min_sleep_ms: 200 }
-    kraken:   { max_requests_per_min: 45, min_sleep_ms: 250 }
-  bootstrap_days_default:
-    "1m": 7
-    "5m": 14
-    "15m": 30
-    "1h": 365
-    "4h": 730
-    "1d": 1825
-  retention_days:
-    "1m": 90
-    "5m": 90
-    "15m": 365
-    "1h": 1825
-    "4h": 1825
-    "1d": 3650
-  max_gap_pct_accept: 0.50  # will tighten after staged backfill completes
-  bootstrap_days_override: {"1m": 1, "5m": 3}
-  staged_backfill:
-    enabled: true
-    targets_days:
-      "1m": [1, 3, 7]
-      "5m": [3, 14, 30]
-      "15m": [7, 30, 90]
+    core: ["1m","5m","1h"]       # TEMP: trim to essential tfs
+    moonshot: ["1m","5m"]          # TEMP
+    eil: "on_demand"
+  partial_harvest: false            # TEMP CHANGE: disable rotation to fill 1h coverage quickly (will revert to true after EIL starts)
+  aggregate_timeframes:
+    enabled: false                  # TEMP: skip synthetic aggregation
+  checkpoint_reconcile:
+    enabled: false                  # TEMP: skip reconcile to reduce noise
+  bootstrap_mode: "inline"          # TEMP: simplify control path
+  min_coverage_for_research: 0.30     # NEW: initial coverage ratio gate for research timeframe
+  high_coverage_threshold: 0.80       # NEW: target after first promotion
+  priority_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT"]  # NEW: tier A ordering
+  panel_target_days: { "1m": 7, "5m": 14, "15m": 30, "1h": 30 }  # NEW: dynamic panel targets (days) for gate derivation
+  bootstrap_days_default: { "1m": 2, "5m": 7, "15m": 14, "1h": 45, "4h": 120, "1d": 365 }  # NEW: default historical depth per timeframe (days) used when no checkpoint; aligns with staged_backfill & avoids KeyError
+  # NOTE: values are config knobs (no magic); adjust to trade off initial IO vs statistical power.
+  # per_exchange_bootstrap optional override structure: { exchange: { timeframe: days } }
 
 screener:
   snapshot_dir: "data/screener_snapshots"
   min_24h_volume_usd: 10000000
   min_price: 0.20
-  max_markets: 24
+  max_markets: 100
   typical_order_usd: 200
   max_spread_bps: 25
   max_impact_bps: 60
   stablecoin_parity_warn_bps: 100
   derivatives_enabled: false
   sentiment_weight: 0.0
+  exclude_stable_stable: true  # NEW: skip stablecoin <-> stablecoin pairs
 
 feeds:
-  cryptopanic: { enabled: false, window_hours: 6, min_score: -1.0 }
-  onchain:     { enabled: true, min_notional_eth: 100.0 }
+  cryptopanic: { enabled: true }
+  onchain:     { enabled: false, min_notional_eth: 100.0 }  # disabled by default: placeholder returns 0.0 without API key
   orderflow:   { enabled: true, top_levels: 5 }
 
 validation:
   dsr:
-    enabled: false  # TEMP bootstrap: disabled to allow faster initial promotions; revert to true after seeding
-    min_prob: 0.60       # require >=60% probability Sharpe not luck (deflated)
+    enabled: true  # ensure DSR gate on post-bootstrap
+    min_prob: 0.50       # TEMP RELAX (was 0.60)
     benchmark_sr: 0.0
+  sparse_trades:         # NEW: adaptive p-value path for low trade counts
+    enabled: true
+    winrate_p_threshold_trades: 25  # use binomial win-rate test when total trades < this
 
 discovery:
-  population_size: 160
-  generations_per_cycle: 2
-  panel_symbols: 5
+  population_size: 320              # bumped 160→320
+  generations_per_cycle: 3          # bumped 2→3
+  panel_symbols: 5        # MULTI: use up to 5 symbols per panel
   cv_folds: 4
   cv_embargo_bars: 2
-  fdr_alpha: 0.10
-  cv_method: "kfold"        # Cross-validation method ("kfold" default, or "cpcv" for combinatorial purged CV)
-  max_promotions_per_cycle: 3
-  max_promotions_per_day: 12     # promotion-debt guard
-  promotion_buffer_multiplier: 1.0  # set >1.0 (e.g., 1.10) for tighter buffer
+  fdr_alpha: 0.20          # TEMP RELAX: widen FDR alpha for multi-symbol sandbox
+  cv_method: "kfold"
+  auto_cpcv: true                   # NEW: switch to CPCV when panel symbols ≥8 or population large
+  max_promotions_per_cycle: 0       # SANDBOX: freeze promotions during validation
+  max_promotions_per_day: 0         # SANDBOX: prevent any daily promotions
+  promotion_buffer_multiplier: 1.0
   enable_pruning: true
+  defer_until_coverage: true          # NEW: gate research until minimal symbol coverage satisfied
+  min_panel_symbols: 3    # MULTI: require at least 3 symbols covered
+  min_bars_per_symbol: 100            # bars required on research timeframe per symbol before inclusion
   promotion_criteria:
-    min_trades: 40   # TEMP bootstrap (was 75) -> revert after initial active alpha set
-    min_sortino: 1.00  # TEMP bootstrap (was 1.25)
-    max_mdd: 0.20
-    min_sharpe: 0.90  # TEMP bootstrap (was 1.10)
-    min_win_rate: 0.50  # slightly relaxed (was 0.52)
-  factor_correlation_max: 0.80   # factor-aware penalty cut-off
+    min_trades: 30        # TEMP RELAX (was 75) – gather early survivor telemetry
+    min_sortino: 0.50     # TEMP RELAX (was 1.25)
+    max_mdd: 0.30         # TEMP RELAX (was 0.20)
+    min_sharpe: 0.30      # TEMP RELAX (was 1.10)
+    min_win_rate: 0.45    # TEMP RELAX (was 0.52)
+  factor_correlation_max: 0.80
+  enforce_current_gates_on_start: false   # NEW: retroactive gate enforcement for legacy alphas
+  max_return_padding_trim: 5              # NEW: max trailing zero returns to trim per hygiene pass
+  max_population_size: 1000               # NEW: cap genetic population to bound memory
+  feature_min_non_nan_ratio: 0.30         # NEW: minimum non-NaN ratio required to keep a feature active
+  feature_min_variance: 1e-06             # NEW: minimum variance (across sampled panel) required to retain feature
+  reseed_fraction: 0.30                   # NEW: fraction of population to reseed when suppressed-feature formulas detected
+  fitness_drawdown_penalty_scale: 0.40    # NEW: scales drawdown penalty applied to fitness (adaptive risk-aware search)
+  rejection_sample_size: 8                # NEW: max sampled formula ids stored per rejection reason
+  rejection_alert_ratio: 0.70             # NEW: if a single reason exceeds this fraction, flag for adaptive tuning
+  fitness_concentration_penalty_scale: 0.25  # NEW: penalty scale for feature concentration
+  fitness_variance_penalty_scale: 0.15       # NEW: penalty scale for high return volatility
+  fitness_activation_scale: 20              # NEW: activation gain scale (trades) for sparse regimes
+  adaptive:
+    enabled: true
+    continuity_threshold: 0.80          # NEW: threshold for feature continuity (fraction of cycles active)
+    variance_threshold: 0.10            # NEW: threshold for feature variance (relative to mean)
+    continuity_suppression_patience: 5  # NEW: consecutive below-threshold cycles before suppression
+    tuning_enabled: false                # NEW: allow auto-tuning of population size & gates
+    rejection_pval_high_ratio: 0.75     # NEW: if pval rejects > this, enlarge population
+    population_step: 40                 # NEW: step size when adjusting population size
+  debug_relaxed_gates: true             # NEW: flag indicating temporary relaxed survivor thresholds
+  fitness_weights:
+    profit_signal: 0.7
+    trade_signal: 0.3
 
 prober:
   enabled: true
@@ -98,6 +118,18 @@ prober:
 lanes:
   core:     { base_fraction: 0.95, min_fraction: 0.85, max_fraction: 0.99 }
   moonshot: { base_fraction: 0.05, min_fraction: 0.01, max_fraction: 0.20 }
+  smoothing_alpha: 0.30      # NEW: EWMA smoothing for lane performance
+  dead_band: 0.10            # NEW: performance diff within +/- dead_band → no shift
+  max_step_per_cycle: 0.02   # NEW: max absolute moonshot fraction change per cycle
+  probation:                 # NEW: initial cap for fresh moonshot promotions
+    trades_min: 50
+    weight_cap: 0.03
+  retag:                     # NEW: moonshot→core promotion criteria (A)
+    enabled: true
+    min_trades: 300
+    min_sharpe: 1.00
+    min_sortino: 1.20
+    max_mdd: 0.25
 
 portfolio:
   max_alpha_concentration: 0.50
@@ -110,7 +142,7 @@ risk:
   max_symbol_weight: 0.35
   max_gross_weight: 1.00
   max_order_notional_usd: 150
-  max_consecutive_errors: 3
+  max_consecutive_errors: 12   # SANDBOX: raise to avoid premature risk halt while stabilizing
   phases:
     "1000":   { kelly_fraction: 0.6, max_order_notional_usd: 500 }
     "10000":  { kelly_fraction: 0.7, max_order_notional_usd: 1000 }
@@ -125,28 +157,33 @@ execution:
   mode: "paper"
   paper_fees_bps: 18
   paper_slippage_bps: 5
+  max_holding_bars: 24   # NEW: forced exit horizon to boost trade sample entropy
 
 llm:
   provider: "openai"
-  enable: true
+  enable: false   # SANDBOX: disable LLM proposer until loop stable
   max_suggestions_per_cycle: 3
+  threshold_min: -5.0   # NEW: clamp LLM numeric thresholds lower bound
+  threshold_max: 5.0    # NEW: clamp LLM numeric thresholds upper bound
 
 eil:
   enabled: true
-  fast_window_days: 45
+  fast_window_days: 75  # CHANGED: extended from 45→75 to increase statistical power (see migration-notes 2025-08-22)
   max_parallel_jobs: 8
   max_queue: 5000
   survivor_top_k: 25
+  scan_batch_size: 200   # NEW: Redis SCAN batch size for EIL candidates
 
 adaptive:
   enabled: true
   stop_vol_window_bars: 24
   daily_stop_pct_floor: 0.05
   daily_stop_pct_ceiling: 0.20
+  stop_vol_multiplier: 6.0
   screener_max_markets_min: 12
   screener_max_markets_max: 36
   population_size_min: 120
-  population_size_max: 240
+  population_size_max: 400          # bumped ceiling 240→400
 
 registry:
   allowed_quotes_global: ["USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD","EUR","GBP"]
@@ -160,4 +197,6 @@ registry:
   catalog_refresh_seconds: 900
   timeframe_aliases_by_venue:
     coinbase:
-      "4h": "6h"
+      "6h": "6h"
+    kraken:
+      "6h": "4h"

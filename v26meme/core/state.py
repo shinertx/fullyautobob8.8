@@ -1,48 +1,130 @@
-import json, time
+import json
+import time
+from typing import Any, Dict, List, Tuple, Optional, cast
+
 import redis
-from typing import Any, Dict, List, Tuple
 from loguru import logger
 
+
 class StateManager:
-    def __init__(self, host='localhost', port=6379):
-        self.r = redis.Redis(host=host, port=port, decode_responses=True)
+    """Redis-backed state manager.
+
+    PIT NOTE: Pure persistence layer; contains no time-dependent branching that could
+    induce non-determinism beyond wall-clock timestamps explicitly stored (e.g. equity curve).
+    """
+
+    def __init__(self, host: str = 'localhost', port: int = 6379) -> None:
+        self.r: redis.Redis = redis.Redis(host=host, port=port, decode_responses=True)  # sync client
         try:
             self.r.ping()
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f"Could not connect to Redis: {e}")
+        except Exception as e:  # broad: redis lib raises various connection exceptions
+            logger.error(f"Redis connection failed: {e}")
             raise
 
-    def set(self, key: str, value: Any): self.r.set(key, json.dumps(value))
-    def get(self, key: str):
-        val = self.r.get(key)
-        return json.loads(val) if val else None
-    def hset(self, key: str, field: str, value: Any): self.r.hset(key, field, json.dumps(value))
-    def hget(self, key: str, field: str):
-        v = self.r.hget(key, field); return json.loads(v) if v else None
+    # --------------------- internal helpers ---------------------
+    @staticmethod
+    def _json_load(raw: Optional[str]) -> Any:
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
 
-    def heartbeat(self): self.r.set('heartbeat_ts', int(time.time()))
+    # --------------------- simple KV ----------------------------
+    def set(self, key: str, value: Any) -> None:
+        self.r.set(key, json.dumps(value))
 
+    def get(self, key: str) -> Any:
+        raw = cast(Optional[str], self.r.get(key))
+        return self._json_load(raw)
+
+    # --------------------- hash ops -----------------------------
+    def hset(self, key: str, field: str, value: Any) -> None:
+        self.r.hset(key, field, json.dumps(value))
+
+    def hget(self, key: str, field: str) -> Any:
+        raw = cast(Optional[str], self.r.hget(key, field))
+        return self._json_load(raw)
+
+    # --------------------- batch ops ----------------------------
+    def multi_set(self, mapping: Dict[str, Any]) -> None:
+        """Pipeline multiple set operations for performance.
+        Deterministic; order of keys does not affect semantics.
+        """
+        pipe = self.r.pipeline()
+        for k, v in mapping.items():
+            pipe.set(k, json.dumps(v))
+        pipe.execute()
+
+    # --------------------- portfolio ----------------------------
     def get_portfolio(self) -> Dict[str, Any]:
-        return self.get('portfolio') or {'cash': 200.0, 'equity': 200.0, 'positions': {}}
-    def set_portfolio(self, portfolio: Dict[str, Any]): self.set('portfolio', portfolio)
+        val = self.get('portfolio')
+        if not isinstance(val, dict):  # initialize if absent or corrupted
+            return {'cash': 200.0, 'equity': 200.0, 'positions': {}}
+        return val
 
-    def log_historical_equity(self, equity: float):
+    def set_portfolio(self, portfolio: Dict[str, Any]) -> None:
+        self.set('portfolio', portfolio)
+
+    # --------------------- equity curve -------------------------
+    def log_historical_equity(self, equity: float) -> None:
         ts = int(time.time())
         self.r.zadd('equity_curve', {json.dumps({'ts': ts, 'equity': equity}): ts})
+
     def get_equity_curve(self) -> List[Dict[str, Any]]:
-        return [json.loads(v) for v in self.r.zrange('equity_curve', 0, -1)]
+        raw = self.r.zrange('equity_curve', 0, -1)  # expected list[str] with decode_responses
+        items: List[str] = []
+        if isinstance(raw, list):  # defensive for type checker
+            items = [s for s in raw if isinstance(s, str)]
+        out: List[Dict[str, Any]] = []
+        for v in items:
+            parsed = self._json_load(v)
+            if isinstance(parsed, dict):
+                out.append(parsed)
+        return out
 
-    def get_active_alphas(self) -> List[Dict[str, Any]]: return self.get('active_alphas') or []
-    def set_active_alphas(self, alphas: List[Dict[str, Any]]): self.set('active_alphas', alphas)
+    # --------------------- alpha registry -----------------------
+    def get_active_alphas(self) -> List[Dict[str, Any]]:
+        val = self.get('active_alphas')
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+        return []
 
-    def gene_incr(self, gene: str, fitness: float):
+    def set_active_alphas(self, alphas: List[Dict[str, Any]]) -> None:
+        self.set('active_alphas', alphas)
+
+    # --------------------- gene stats ---------------------------
+    def gene_incr(self, gene: str, fitness: float) -> None:
+        # usage count (#promotions leveraging gene)
         self.r.zincrby('gene_usage', 1, gene)
+        # accumulate raw fitness total to later average
         self.r.hincrbyfloat('gene_fitness', gene, float(fitness))
-    def gene_top(self, min_count=10, top_n=20) -> List[Tuple[str, float]]:
-        genes = self.r.hgetall('gene_fitness')
-        out = []
-        for g, totfit in genes.items():
-            cnt = self.r.zscore('gene_usage', g) or 0
-            if cnt >= min_count:
-                out.append((g, float(totfit)/float(cnt)))
-        return sorted(out, key=lambda x: x[1], reverse=True)[:top_n]
+
+    def gene_top(self, min_count: int = 10, top_n: int = 20) -> List[Tuple[str, float]]:
+        genes_raw = self.r.hgetall('gene_fitness') or {}
+        genes: Dict[str, str] = {}
+        if isinstance(genes_raw, dict):  # runtime guard for type checker
+            tmp: Dict[str, str] = {}
+            for k, v in genes_raw.items():
+                if isinstance(k, str) and isinstance(v, (str, int, float)):
+                    tmp[k] = str(v)
+            genes = tmp
+        out: List[Tuple[str, float]] = []
+        for g, total_fit_raw in genes.items():
+            try:
+                total_fit = float(total_fit_raw)
+            except (TypeError, ValueError):
+                continue
+            cnt_raw = self.r.zscore('gene_usage', g)
+            cnt_f: float = 0.0
+            if isinstance(cnt_raw, (int, float)):
+                cnt_f = float(cnt_raw)
+            if cnt_f >= float(min_count) and cnt_f > 0:
+                out.append((g, total_fit / cnt_f))
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out[:top_n]
+
+    # --------------------- heartbeat ----------------------------
+    def heartbeat(self) -> None:
+        self.r.set('heartbeat_ts', int(time.time()))

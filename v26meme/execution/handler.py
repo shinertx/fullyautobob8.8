@@ -114,6 +114,15 @@ class ExecutionHandler:
 
                 side = 'buy' if delta_usd > 0 else 'sell'
                 fill_px = px * (1 + self.slippage) if side == 'buy' else px * (1 - self.slippage)
+                # Dynamic slippage override if table entry exists (bps)
+                try:
+                    slip_table = self.state.get('slippage:table') or {}
+                    bps_entry = slip_table.get(sym)
+                    if isinstance(bps_entry, (int, float)) and bps_entry >= 0:
+                        dyn_slip = float(bps_entry) / 10000.0
+                        fill_px = px * (1 + dyn_slip) if side == 'buy' else px * (1 - dyn_slip)
+                except Exception:
+                    pass
                 fill_px = self._price_to_precision(ex_sym, fill_px)
                 qty = abs(delta_usd) / max(1e-12, fill_px)
                 qty = self._amount_to_precision(ex_sym, qty)

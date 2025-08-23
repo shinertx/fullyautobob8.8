@@ -15,10 +15,11 @@ def _evaluate_formula(row, formula):
         return _evaluate_formula(row, left) or _evaluate_formula(row, right)
 
 class SimLab:
-    def __init__(self, fees_bps, slippage_bps, slippage_table=None):
+    def __init__(self, fees_bps, slippage_bps, slippage_table=None, max_holding_bars: int | None = None):
         self.fee = fees_bps/10000.0
         self.slippage = slippage_bps/10000.0
         self.slip_table = slippage_table or {}
+        self.max_holding_bars = max_holding_bars
 
     def _stats(self, returns: pd.Series) -> dict:
         if returns.empty: return {"n_trades": 0}
@@ -42,23 +43,35 @@ class SimLab:
     def run_backtest(self, df: pd.DataFrame, formula: list) -> dict:
         if df.empty or len(df) < 60: return {}
         df = df.copy()
-        # derive conservative slippage per-canonical if annotated
         display = df.attrs.get("display", None)
         slip = self._slip_for(display) if display else self.slippage
         signals = df.apply(lambda row: _evaluate_formula(row, formula), axis=1)
         edges = signals.diff().fillna(0)
-        in_trade, entry_price = False, 0.0
+        try:
+            edges = edges.astype(int)
+        except Exception:
+            edges = edges.apply(lambda x: 1 if x>0 else (-1 if x<0 else 0))
+        in_trade, entry_price, entry_idx = False, 0.0, 0
         trades = []
+        hold_lengths = []
         for i in range(len(df)):
+            force_exit = False
+            if in_trade and self.max_holding_bars is not None and (i - entry_idx) >= self.max_holding_bars:
+                force_exit = True
             if edges.iloc[i] > 0 and not in_trade:
-                in_trade, entry_price = True, df['close'].iloc[i] * (1 + slip)
-            elif edges.iloc[i] < 0 and in_trade:
+                in_trade, entry_price, entry_idx = True, df['close'].iloc[i] * (1 + slip), i
+            elif (edges.iloc[i] < 0 or force_exit) and in_trade:
                 in_trade = False
                 exit_price = df['close'].iloc[i] * (1 - slip)
                 trades.append(((exit_price-entry_price)/entry_price) - (2*self.fee))
+                hold_lengths.append(i - entry_idx)
         if in_trade:
             exit_price = df['close'].iloc[-1] * (1 - slip)
             trades.append(((exit_price-entry_price)/entry_price) - (2*self.fee))
+            hold_lengths.append(len(df) - entry_idx)
         if not trades: return {"all": {"n_trades": 0}}
         ser = pd.Series(trades)
-        return {"all": self._stats(ser)}
+        stats = self._stats(ser)
+        stats['median_hold'] = float(pd.Series(hold_lengths).median()) if hold_lengths else 0.0
+        stats['avg_hold'] = float(pd.Series(hold_lengths).mean()) if hold_lengths else 0.0
+        return {"all": stats}

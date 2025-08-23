@@ -1,7 +1,8 @@
 # Thin shim to run the v4.7.5 harvester once (used for bootstrap)
-from v26meme.data.harvester import run, run_once
+from v26meme.data.harvester import run_once  # removed invalid 'run'
 from v26meme.core.state import StateManager
 from typing import Optional, Dict, Any
+import sys, yaml
 
 def harvest(cfg: Dict[str, Any], symbols_map: Optional[Dict[str, Dict[str, str]]] = None) -> None:
     """Bootstrap harvest wrapper expected by cli._ensure_lakehouse_bootstrap.
@@ -20,4 +21,11 @@ def harvest(cfg: Dict[str, Any], symbols_map: Optional[Dict[str, Dict[str, str]]
     run_once(cfg, state)
 
 if __name__ == "__main__":
-    run()
+    # Allow: python data_harvester.py [cycles]
+    cycles = 1
+    if len(sys.argv) > 1:
+        try: cycles = max(1, int(sys.argv[1]))
+        except Exception: cycles = 1
+    cfg = yaml.safe_load(open('configs/config.yaml'))
+    for i in range(cycles):
+        harvest(cfg)

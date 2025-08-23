@@ -11,5 +11,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install --upgrade pip
-      - run: pip install -r requirements.txt pytest
+      - run: pip install -r requirements.txt pytest ruff mypy
       - run: pytest -q
+      - run: ruff check .
+      - run: mypy --ignore-missing-imports --exclude v26meme/llm --install-types --non-interactive v26meme || true
