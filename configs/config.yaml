@@ -13,19 +13,19 @@ data_source:
 
 # v4.7.5 data-plane
 harvester:
-  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","LTC_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT"]
-  restrict_single_symbol: false
-  dynamic_enabled: false
+  core_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT","LTC_USD_SPOT","UNI_USD_SPOT","ATOM_USD_SPOT"]  # MULTI: re-enable broader panel for EIL entropy
+  restrict_single_symbol: false      # DISABLE: allow multi-symbol evolutionary panel
+  dynamic_enabled: false            # TEMP: freeze universe expansion
   timeframes_by_lane:
-    core: ["1m","5m","1h"]
-    moonshot: ["1m","5m"]
+    core: ["1m","5m","1h"]       # TEMP: trim to essential tfs
+    moonshot: ["1m","5m"]          # TEMP
     eil: "on_demand"
-  partial_harvest: true          # PHASE1: re-enable for cadence
+  partial_harvest: false            # TEMP CHANGE: disable rotation to fill 1h coverage quickly (will revert to true after EIL starts)
   aggregate_timeframes:
-    enabled: true                # PHASE1: restore synthetic aggregation
+    enabled: false                  # TEMP: skip synthetic aggregation
   checkpoint_reconcile:
-    enabled: true                # PHASE1: restore forward reconcile
-  bootstrap_mode: "inline"
+    enabled: false                  # TEMP: skip reconcile to reduce noise
+  bootstrap_mode: "inline"          # TEMP: simplify control path
   min_coverage_for_research: 0.30     # NEW: initial coverage ratio gate for research timeframe
   high_coverage_threshold: 0.80       # NEW: target after first promotion
   priority_symbols: ["BTC_USD_SPOT","ETH_USD_SPOT","SOL_USD_SPOT"]  # NEW: tier A ordering
@@ -54,60 +54,57 @@ feeds:
 
 validation:
   dsr:
-    enabled: true
-    min_prob: 0.50
+    enabled: true  # ensure DSR gate on post-bootstrap
+    min_prob: 0.50       # TEMP RELAX (was 0.60)
     benchmark_sr: 0.0
-  sparse_trades:
+  sparse_trades:         # NEW: adaptive p-value path for low trade counts
     enabled: true
-    winrate_p_threshold_trades: 25
+    winrate_p_threshold_trades: 25  # use binomial win-rate test when total trades < this
 
 discovery:
-  population_size: 320
-  generations_per_cycle: 3
-  panel_symbols: 5
+  population_size: 320              # bumped 160→320
+  generations_per_cycle: 3          # bumped 2→3
+  panel_symbols: 5        # MULTI: use up to 5 symbols per panel
   cv_folds: 4
   cv_embargo_bars: 2
-  fdr_alpha: 0.20
+  fdr_alpha: 0.20          # TEMP RELAX: widen FDR alpha for multi-symbol sandbox
   cv_method: "kfold"
-  auto_cpcv: true
-  max_promotions_per_cycle: 1        # PHASE1: allow limited promotions
-  max_promotions_per_day: 3          # PHASE1: limited daily promotions
+  auto_cpcv: true                   # NEW: switch to CPCV when panel symbols ≥8 or population large
+  max_promotions_per_cycle: 0       # SANDBOX: freeze promotions during validation
+  max_promotions_per_day: 0         # SANDBOX: prevent any daily promotions
   promotion_buffer_multiplier: 1.0
   enable_pruning: true
-  defer_until_coverage: true
-  min_panel_symbols: 3
-  min_bars_per_symbol: 100
+  defer_until_coverage: true          # NEW: gate research until minimal symbol coverage satisfied
+  min_panel_symbols: 3    # MULTI: require at least 3 symbols covered
+  min_bars_per_symbol: 100            # bars required on research timeframe per symbol before inclusion
   promotion_criteria:
-    min_trades: 40                  # PHASE1: step up from 30
-    min_sortino: 0.60               # PHASE1 tightened
-    max_mdd: 0.30
-    min_sharpe: 0.50                # PHASE1 tightened
-    min_win_rate: 0.48              # PHASE1 tightened
+    min_trades: 30        # TEMP RELAX (was 75) – gather early survivor telemetry
+    min_sortino: 0.50     # TEMP RELAX (was 1.25)
+    max_mdd: 0.30         # TEMP RELAX (was 0.20)
+    min_sharpe: 0.30      # TEMP RELAX (was 1.10)
+    min_win_rate: 0.45    # TEMP RELAX (was 0.52)
   factor_correlation_max: 0.80
-  enforce_current_gates_on_start: false
-  max_return_padding_trim: 5
-  max_population_size: 1000
-  feature_min_non_nan_ratio: 0.30
-  feature_min_variance: 1e-06
-  reseed_fraction: 0.30
-  fitness_drawdown_penalty_scale: 0.40
-  rejection_sample_size: 8
-  rejection_alert_ratio: 0.70
-  fitness_concentration_penalty_scale: 0.25
-  fitness_variance_penalty_scale: 0.15
-  fitness_activation_scale: 20
-  fitness_activation_weight: 0.5     # NEW: weight for activation_gain modulation
-  max_formula_depth: 3               # NEW: enable deeper boolean trees
-  depth3_prob: 0.25                  # NEW: probability of sampling depth 3 formulas
+  enforce_current_gates_on_start: false   # NEW: retroactive gate enforcement for legacy alphas
+  max_return_padding_trim: 5              # NEW: max trailing zero returns to trim per hygiene pass
+  max_population_size: 1000               # NEW: cap genetic population to bound memory
+  feature_min_non_nan_ratio: 0.30         # NEW: minimum non-NaN ratio required to keep a feature active
+  feature_min_variance: 1e-06             # NEW: minimum variance (across sampled panel) required to retain feature
+  reseed_fraction: 0.30                   # NEW: fraction of population to reseed when suppressed-feature formulas detected
+  fitness_drawdown_penalty_scale: 0.40    # NEW: scales drawdown penalty applied to fitness (adaptive risk-aware search)
+  rejection_sample_size: 8                # NEW: max sampled formula ids stored per rejection reason
+  rejection_alert_ratio: 0.70             # NEW: if a single reason exceeds this fraction, flag for adaptive tuning
+  fitness_concentration_penalty_scale: 0.25  # NEW: penalty scale for feature concentration
+  fitness_variance_penalty_scale: 0.15       # NEW: penalty scale for high return volatility
+  fitness_activation_scale: 20              # NEW: activation gain scale (trades) for sparse regimes
   adaptive:
     enabled: true
-    continuity_threshold: 0.80
-    variance_threshold: 0.10
-    continuity_suppression_patience: 5
-    tuning_enabled: true
-    rejection_pval_high_ratio: 0.75
-    population_step: 40
-  debug_relaxed_gates: false         # PHASE1: disable FDR bypass
+    continuity_threshold: 0.80          # NEW: threshold for feature continuity (fraction of cycles active)
+    variance_threshold: 0.10            # NEW: threshold for feature variance (relative to mean)
+    continuity_suppression_patience: 5  # NEW: consecutive below-threshold cycles before suppression
+    tuning_enabled: false                # NEW: allow auto-tuning of population size & gates
+    rejection_pval_high_ratio: 0.75     # NEW: if pval rejects > this, enlarge population
+    population_step: 40                 # NEW: step size when adjusting population size
+  debug_relaxed_gates: true             # NEW: flag indicating temporary relaxed survivor thresholds
   fitness_weights:
     profit_signal: 0.7
     trade_signal: 0.3
@@ -145,7 +142,7 @@ risk:
   max_symbol_weight: 0.35
   max_gross_weight: 1.00
   max_order_notional_usd: 150
-  max_consecutive_errors: 8     # PHASE1: step down from 12
+  max_consecutive_errors: 12   # SANDBOX: raise to avoid premature risk halt while stabilizing
   phases:
     "1000":   { kelly_fraction: 0.6, max_order_notional_usd: 500 }
     "10000":  { kelly_fraction: 0.7, max_order_notional_usd: 1000 }

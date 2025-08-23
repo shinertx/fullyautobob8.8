@@ -623,51 +623,62 @@ Risks / Mitigations:
 - Delayed accumulation of survivor set (intentional); mitigated by planned reactivation milestone.
 - Higher error threshold could delay kill-switch on real faults; mitigation: manual log monitoring during sandbox phase.
 
-## 2025-08-22 EIL Phase1 Activation (Composite Fitness + Sparse Trade P-Value + Promotions Unfrozen)
+## 2025-08-22 EIL Core Evolution and Fitness Function Upgrade (Draft Summary)
 
-Changes:
-- Integrated activation_gain into fitness: `fitness = base_fitness * ((1-activation_weight) + activation_weight*activation_gain)`; base_fitness = w_profit*sortino_floor0 + w_trade*log1p(trades).
-- Added config knobs: `discovery.fitness_activation_weight` (default 0.5), `discovery.max_formula_depth` (3), `discovery.depth3_prob` (0.25) enabling deeper boolean trees.
-- Implemented sparse trade binomial fallback p-value when `validation.sparse_trades.enabled` and total pooled trades < `winrate_p_threshold_trades` and original CV p_val >=0.95.
-- Disabled FDR debug bypass (`discovery.debug_relaxed_gates=false`).
-- Unfroze promotions with conservative caps (`max_promotions_per_cycle=1`, `max_promotions_per_day=3`).
-- Tightened initial relaxed promotion gates (trades 40, sortino 0.60, sharpe 0.50, win_rate 0.48) keeping mdd 0.30.
-- Re-enabled harvester cadence & robustness: `partial_harvest=true`, `aggregate_timeframes.enabled=true`, `checkpoint_reconcile.enabled=true`.
-- Reduced risk sandbox tolerance: `risk.max_consecutive_errors=8` (down from 12) ahead of full restoration to 3.
+User-intent summary of recent / ongoing EIL changes and diagnostic path. NOTE: Some items below are partially implemented (activation gain + instrumentation) while others (full composite fitness weights, verified survivor emergence) remain in-progress.
 
-Rationale:
-- Activation modulation rewards evaluable (higher trade count) formulas without letting raw trade count dominate profitability signals.
-- Deeper trees (depth 3) expand search space for interaction alphas while constraining explosion via probability sampling.
-- Sparse-trade binomial fallback recovers statistical power for early short histories, reducing blanket p=1.0 outcomes and enabling genuine edge differentiation.
-- Controlled reintroduction of promotions to start building survivor set under monitored, partially tightened gates.
-- Restored data-plane maintenance (aggregation & checkpoint reconciliation) to prevent higher timeframe starvation during survivor emergence.
+**Summary:**
+Critical focus on restoring the Evolutionary Iteration Loop (EIL) to produce evaluable, higher‑entropy candidate formulas. Investigation isolated a flat fitness landscape (sparse trades, low Sharpe dispersion, p=1.0 CV collapse). Incremental patches (df_cache retention, activation gain, multi‑symbol panel, instrumentation) improved trade counts and reduced zero‑trade formulas, but statistically significant survivors still gated by p‑value path.
 
-Operational Impact Expectations:
-- Median p_value should decline (<0.8 within several generations) as binomial fallback engages on low-trade candidates.
-- Zero-trade formula ratio should stay <20% due to activation pressure and deeper interaction diversity.
-- At most 1 promotion per cycle; monitor dsr_prob and post-promotion risk metrics.
-- Slight runtime increase per generation from binomial test (negligible given small trade counts).
+**Changes (current vs claimed):**
+1. `generator.py`
+   - Existing subtree crossover & multi‑operator mutation confirmed (threshold / feature / operator / logical op). Max depth still 2 (deeper depth expansion not yet applied).
+   - Diversity improvements planned (variable depth >2, additional logical forms) – NOT yet merged.
+2. `feature_factory.py`
+   - Single lag application already in place for price‑derived features; no redundant double shifts detected in current version. (Claimed multi‑shift removal not required.)
+3. `hyper_lab.py`
+   - Added activation_gain term (exp saturation on trades) and p-value / Sharpe / trades distribution logging (`EIL_DIST`).
+   - Added FDR debug bypass + survivor telemetry scaffolding.
+   - Composite fitness (profit vs activation weights) NOT yet integrated; current fitness still mean_sharpe * trade_factor * penalties (drawdown / concentration / variance). Activation gain presently logged but not multiplied into fitness (pending decision).
+4. `configs/config.yaml`
+   - Relaxed gates (temporary) + multi-symbol expansion. `fitness_weights` block NOT yet added (pending final design / normalization).
 
-Verification Checklist:
-- [ ] Logs show `SURVIVOR` within first 10 generations (else consider lowering sortino gate to 0.5 temporarily).
-- [ ] `eil:diag:last_pval_stats` median < 0.8 for ≥3 consecutive generations.
-- [ ] `eil:degenerate_pct` < 0.20 after depth3_prob introduction.
-- [ ] Promotions capped at 1/cycle and ≤3/day (check logs and Redis promotion counters).
-- [ ] No spike in `harvest:errors` after re-enabling aggregation & reconcile.
+**Operational Impact (observed):**
+- zero_trade_formulas reduced from >50% → ~3–15% in multi-symbol runs.
+- trades_med improved episodically (peaks >100 under earlier activation experiment; currently ~12–20 after config adjustments).
+- sharpe_med modestly positive (≈0.4–0.55) but pvals_med remains 1.0 in later cycles (statistical power still insufficient / CV path still sparse-trade fragile).
+- No validated `SURVIVOR` log lines yet (all candidates failing gates even with FDR bypass due to downstream metrics or p-value degeneracy).
 
-Rollback:
-- Set `discovery.debug_relaxed_gates=true` to temporarily bypass FDR again (diagnostics only).
-- Remove new knobs or set `max_formula_depth=2`, `depth3_prob=0.0` for legacy behavior.
-- Disable sparse-trade fallback via `validation.sparse_trades.enabled=false` if p-value path unstable.
-- Refreeze promotions setting max_promotions_per_cycle/day to 0.
+**Next Steps (planned to complete this migration):**
+- Implement sparse-trade CV adaptation (binomial win-rate test fallback before t-test) to meaningfully lower p-values when directional edge present.
+- Integrate composite fitness with configurable weights (`discovery.fitness_weights.profit`, `discovery.fitness_weights.activation`) and normalized sum=1; include activation_gain multiplier.
+- Optionally incorporate activation diversity tie-break (small feature_count_used epsilon) for deterministic ordering.
+- Add telemetry: `eil:diag:fitness_breakdown` per generation (median components).
+- Post-success tighten gates (remove debug_relaxed_gates, restore FDR-only path) and document promotion readiness.
 
-Risks / Mitigations:
-- Over-expansion of complex formulas: mitigated by probabilistic depth sampling (0.25) and retained pruning.
-- False positives from binomial fallback on very low N: two-sided exact test controls Type I; gates + DSR further filter.
-- Increased compute: monitor cycle duration; if >1.5x baseline, reduce population_size or depth3_prob.
+**Verification Checklist (pending completion):**
+- [ ] First survivor under debug bypass (SURVIVOR log) with recorded dsr_prob & p_value.
+- [ ] pvals_med < 0.80 after sparse-CV patch on ≥2 consecutive generations.
+- [ ] fitness_breakdown shows both profit & activation contributions >0 for median formula.
+- [ ] zero_trade_formulas stable < 0.20 across ≥5 generations.
+- [ ] Removal of debug bypass still yields ≥1 survivor within 10 generations (else re-tune).
 
-Monitoring Keys:
-- Redis: `eil:diag:last_pval_stats`, `eil:rej:counts`, `eil:diag:last_survivor`, `eil:degenerate_pct`.
-- Logs: `SURVIVOR`, `EIL_DIST`, `PROMOTED`.
+**Rollback Guidance:**
+Not recommended mid-migration; partial rollback could reintroduce flat landscape. If required, revert only incremental activation_gain & instrumentation blocks (retain df_cache fix). Avoid re-tightening gates until sparse-CV path merged.
 
----
+**Risk / Guardrail Notes:**
+- PIT integrity preserved (no forward data; only threshold sampling & historical bars used).
+- No secrets added; config knobs to centralize any new constants (activation scales, weight fractions).
+- Anti-ruin rails untouched (risk module unaffected by EIL internal fitness changes).
+
+(End of 2025-08-22 draft entry)
+
+## 2025-08-22 EIL Window Extension (45→75 days)
+Extended `eil.fast_window_days` from 45 to 75 to increase per-fold sample size and statistical power for p-value (BH-FDR) path. Monitoring checklist:
+- [ ] pvals_med < 0.90 within 5 generations post-change.
+- [ ] trades_med increases (baseline recorded pre-change).
+- [ ] Cycle duration increase < 1.8x (guard compute budget).
+Rollback if: cycle latency >2x AND no pvals_med improvement after 12 generations.
+
+## 2025-08-22 Harvester Bootstrap Defaults Added
+Added `harvester.bootstrap_days_default` mapping (1m:2, 5m:7, 15m:14, 1h:45, 4h:120, 1d:365) to remove KeyError in `harvester.run_once` and make historical depth explicit & tunable (replaces implicit 30d fallback). Guards staged_backfill logic and deep_backfill_override coverage checks.

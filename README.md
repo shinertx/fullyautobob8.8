@@ -178,6 +178,7 @@ NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `pyt
 * **Orderflow microstructure features:** The screener now injects order-book metrics (bid/ask imbalance, spread (bps), microprice deviation) into each instrument when `feeds.orderflow.enabled=true`. This enriches universe selection with real-time liquidity signals.
 * **Combinatorial Purged CV (CPCV):** In addition to standard purged K-fold cross-validation, you can enable CPCV (set `discovery.cv_method: "cpcv"`) to evaluate strategies across multiple train/test fold combinations for more robust fitness estimates.
 * **Candle hygiene:** The Lakehouse data loader drops the latest OHLCV bar if it’s still in an open interval, preventing partial-bar lookahead. This check parses the timeframe (e.g. 1m, 1h) and omits any not-yet-closed candle from model data.
+* **Group C (2025-08-22) Diversity & Speciation:** Added structural feature-set Jaccard clustering (`discovery.diversity.*`) with diversity fitness weight (`fitness_extras.weights.diversity`), per-cycle telemetry `eil:diag:diversity`, greedy speciation clusters, diversity bonus (1 - median Jaccard), cluster size penalty, and promotion gate requiring ≥1 (≥2 for large populations) clusters to reduce convergence and factor crowding.
 
 ## 🌐 Data & Universe
 

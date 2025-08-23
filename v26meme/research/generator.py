@@ -5,48 +5,40 @@ class GeneticGenerator:
     def __init__(self, features: List[str], population_size: int, seed: int = 1337,
                  feature_stats: Optional[Dict[str, Dict[str, float]]] = None,
                  quantile_low: float = 0.10, quantile_high: float = 0.90,
-                 max_formula_depth: int = 2, depth3_prob: float = 0.0):
-        """Genetic boolean formula generator (adaptive threshold domain).
+                 max_tree_depth: int = 3,
+                 mutation_cfg: Optional[Dict[str, float]] = None,
+                 elite_fraction: float = 0.10,
+                 survivor_mix_fraction: float = 0.25):
+        """Genetic boolean formula generator (adaptive threshold domain, configurable depth & mutation).
 
-        PIT: All randomness seeded; uses only historical *feature_stats* passed in (empirical
-        quantiles computed from already harvested, closed bars) – no forward leakage.
+        PIT: All randomness seeded; relies only on supplied *feature_stats* (closed-bar derived).
 
-        Parameters
-        ----------
-        features : list[str]
-            Candidate feature names.
-        population_size : int
-            Target population size (fixed per evolution cycle).
-        seed : int
-            RNG seed for deterministic reproducibility.
-        feature_stats : dict | None
-            Mapping feature → {"q_low","q_high","min","max"} (empirical). If provided, the
-            random threshold sampling domain for that feature is [q_low, q_high]. Fallback to
-            [min, max] then static [-2,2] if absent (maintains backward compatibility).
-        quantile_low / quantile_high : float
-            Adaptive quantile bounds (configurable knobs, no magic numbers) used when feature_stats
-            present. Default 10%–90% band encourages mid-distribution variance (reduces constant predicates).
-        max_formula_depth : int
-            Maximum recursive boolean tree depth (>=2). Raising depth increases interaction space.
-        depth3_prob : float
-            Probability of sampling depth=max_formula_depth (allows controlled deeper exploration without exploding search space).
+        Parameters (adaptive knobs, no magic numbers):
+          max_tree_depth: maximum recursive depth for newly created formulas.
+          mutation_cfg: dict with rates (threshold_rate, feature_rate, operator_rate, logical_rate, jitter_min, jitter_max)
+          elite_fraction: fraction of top unique structures carried forward unchanged.
+          survivor_mix_fraction: fraction of new population reseeded from elite via single-mutation perturbations.
         """
         self.features = features
         self.operators = ['>', '<']
         self.logical_ops = ['AND', 'OR']
         self.population_size = population_size
         self.population: List[list] = []
-        # Mutation jitter bounds (adaptive knobs; kept explicit & documented)
-        self.mutation_jitter_min = -0.2
-        self.mutation_jitter_max = 0.2
-        # Absolute hard safety rails (fallback if stats missing)
-        self.threshold_min = -3.0
-        self.threshold_max = 3.0
         self.feature_stats = feature_stats or {}
         self.q_low = quantile_low
         self.q_high = quantile_high
-        self.max_formula_depth = max(2, int(max_formula_depth))
-        self.depth3_prob = max(0.0, min(1.0, depth3_prob))
+        self.max_tree_depth = max_tree_depth
+        mcfg = mutation_cfg or {}
+        self.mutation_threshold_rate = float(mcfg.get('threshold_rate', 0.30))
+        self.mutation_feature_rate = float(mcfg.get('feature_rate', 0.10))
+        self.mutation_operator_rate = float(mcfg.get('operator_rate', 0.10))
+        self.mutation_logical_rate = float(mcfg.get('logical_rate', 0.10))
+        self.mutation_jitter_min = float(mcfg.get('jitter_min', -0.2))
+        self.mutation_jitter_max = float(mcfg.get('jitter_max', 0.2))
+        self.threshold_min = -3.0
+        self.threshold_max = 3.0
+        self.elite_fraction = min(0.90, max(0.0, elite_fraction))
+        self.survivor_mix_fraction = min(0.90, max(0.0, survivor_mix_fraction))
         random.seed(seed)
 
     def set_feature_stats(self, feature_stats: Dict[str, Dict[str, float]]) -> None:
@@ -75,10 +67,9 @@ class GeneticGenerator:
         feat = random.choice(self.features)
         return [feat, random.choice(self.operators), self._sample_threshold(feat)]
 
-    def _create_random_formula(self, max_depth=2):
-        # Allow deeper trees based on configured probability (depth3_prob) and max_formula_depth
-        if max_depth == 2 and self.max_formula_depth >= 3 and random.random() < self.depth3_prob:
-            max_depth = self.max_formula_depth
+    def _create_random_formula(self, max_depth=None):
+        if max_depth is None:
+            max_depth = self.max_tree_depth
         if max_depth <= 0 or random.random() > 0.5:
             return self._create_random_condition()
         return [self._create_random_formula(max_depth-1), random.choice(self.logical_ops), self._create_random_formula(max_depth-1)]
@@ -115,57 +106,70 @@ class GeneticGenerator:
         return child
 
     def run_evolution_cycle(self, fitness_scores: dict):
-        if not self.population: self.initialize_population()
-        # Deduplicate by structural JSON form
+        if not self.population:
+            self.initialize_population()
         str_pop = {json.dumps(f, separators=(',',':')): f for f in self.population}
-        # Rank by fitness (deterministic tie-break via string)
-        sorted_pop = sorted(str_pop.keys(), key=lambda s: (
-            -fitness_scores.get(hashlib.sha256(s.encode()).hexdigest(), 0.0), s))
-        elite_n = max(1, int(len(sorted_pop)*0.1))
-        new_pop = sorted_pop[:elite_n]
-        # Crossover + mutation
-        while len(new_pop) < self.population_size:
-            p1_str, p2_str = random.choices(sorted_pop[:max(2, len(sorted_pop)//2)], k=2)
-            p1 = json.loads(p1_str)
-            p2 = json.loads(p2_str)
+        # Elite selection
+        sorted_pop = sorted(str_pop.keys(), key=lambda s: (-fitness_scores.get(hashlib.sha256(s.encode()).hexdigest(), 0.0), s))
+        elite_n = max(1, int(len(sorted_pop)*self.elite_fraction))
+        elites = sorted_pop[:elite_n]
+        new_structs = elites[:]  # retain elites
+        # Survivor mix (perturbed elites) pre-fill
+        mix_target = max(0, int(self.population_size * self.survivor_mix_fraction))
+        while len(new_structs) < elite_n + mix_target and len(new_structs) < self.population_size:
+            base = json.loads(random.choice(elites))
+            # single mutation perturbation
+            nodes = [n for n in self._get_subtrees(base) if not isinstance(n[0], list)]
+            if nodes:
+                n = random.choice(nodes)
+                # jitter threshold
+                try:
+                    feat = n[0]; cur_thr = float(n[2])
+                    jitter = 1.0 + random.uniform(self.mutation_jitter_min, self.mutation_jitter_max)
+                    n[2] = max(self.threshold_min, min(self.threshold_max, cur_thr * jitter))
+                except Exception:
+                    pass
+            new_structs.append(json.dumps(base, separators=(',',':')))
+        # Crossover + standard mutation
+        while len(new_structs) < self.population_size:
+            p1_str, p2_str = random.choices(elites if len(elites) >=2 else sorted_pop[:max(2,len(sorted_pop)//2)], k=2)
+            p1 = json.loads(p1_str); p2 = json.loads(p2_str)
             child = self._crossover(p1, p2)
-
-            # Mutation
-            if random.random() < 0.30:  # threshold mutation
+            # Mutations (config-driven rates)
+            if random.random() < self.mutation_threshold_rate:
                 nodes = [n for n in self._get_subtrees(child) if not isinstance(n[0], list)]
                 if nodes:
                     n = random.choice(nodes)
                     try:
-                        feat = n[0]
-                        cur_thr = float(n[2])
-                        jitter = 1.0 + random.uniform(self.mutation_jitter_min, self.mutation_jitter_max)
-                        base_thr = cur_thr * jitter
+                        feat = n[0]; cur_thr = float(n[2])
                         if random.random() < 0.40:
-                            base_thr = self._sample_threshold(feat)
-                        n[2] = max(self.threshold_min, min(self.threshold_max, base_thr))
+                            n[2] = self._sample_threshold(feat)
+                        else:
+                            jitter = 1.0 + random.uniform(self.mutation_jitter_min, self.mutation_jitter_max)
+                            n[2] = max(self.threshold_min, min(self.threshold_max, cur_thr * jitter))
                     except Exception:
                         pass
-            
-            if random.random() < 0.10: # feature mutation
+            if random.random() < self.mutation_feature_rate:
                 nodes = [n for n in self._get_subtrees(child) if not isinstance(n[0], list)]
                 if nodes:
-                    n = random.choice(nodes)
-                    n[0] = random.choice(self.features)
-
-            if random.random() < 0.10: # operator mutation
+                    random.choice(nodes)[0] = random.choice(self.features)
+            if random.random() < self.mutation_operator_rate:
                 nodes = [n for n in self._get_subtrees(child) if not isinstance(n[0], list)]
                 if nodes:
-                    n = random.choice(nodes)
-                    n[1] = random.choice(self.operators)
-
-            if random.random() < 0.10: # logical op mutation
+                    random.choice(nodes)[1] = random.choice(self.operators)
+            if random.random() < self.mutation_logical_rate:
                 nodes = [n for n in self._get_subtrees(child) if isinstance(n[0], list)]
                 if nodes:
-                    n = random.choice(nodes)
-                    n[1] = random.choice(self.logical_ops)
-
-            new_pop.append(json.dumps(child))
-        self.population = [json.loads(s) for s in new_pop]
+                    random.choice(nodes)[1] = random.choice(self.logical_ops)
+            new_structs.append(json.dumps(child, separators=(',',':')))
+        # Deduplicate preserving order
+        seen = set(); final = []
+        for s in new_structs:
+            if s not in seen:
+                seen.add(s); final.append(json.loads(s))
+            if len(final) >= self.population_size:
+                break
+        self.population = final
 
     def _get_subtrees(self, formula):
         nodes, q = [], [formula]
