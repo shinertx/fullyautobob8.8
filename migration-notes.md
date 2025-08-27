@@ -1,5 +1,61 @@
 # Migration Notes
 
+## 2025-08-26 Configuration Tune for Initial Discovery
+
+Changes:
+- **Loosened Initial Gates:**
+  - `discovery.promotion_criteria.min_trades`: `20` -> `10`
+  - `validation.bootstrap.min_trades`: `60` -> `30`
+- **Flipped Lane Weights:**
+  - `lanes.initial_weights.core`: `0.95` -> `0.05`
+  - `lanes.initial_weights.moonshot`: `0.05` -> `0.95`
+
+Rationale:
+- These changes optimize the system for the crucial initial discovery phase. By lowering the minimum trade requirements, we allow more diverse strategies to enter the validation pipeline. By focusing capital allocation on the `moonshot` lane, we maximize our investment in finding new, profitable alphas from scratch. The system is designed to autonomously shift weight back to the `core` lane as strategies are proven and promoted.
+
+Verification Checklist:
+- [ ] Confirm the updated values in `configs/config.yaml`.
+- [ ] Observe a higher number of candidates passing the initial promotion criteria.
+- [ ] Verify that initial portfolio weights are concentrated in the `moonshot` lane.
+
+Rollback:
+- Revert the values in `configs/config.yaml` to their previous settings.
+
+## 2025-08-26 Evolutionary Algorithm Enhancement: Complexity Penalty
+
+Changes:
+- **Complexity Penalty:** Introduced a complexity penalty in the genetic algorithm's fitness function (`v26meme/research/generator.py`). The fitness of each formula is now penalized based on its size (number of nodes in its syntax tree).
+- **New Config Knob:** Added `discovery.fitness_weights.complexity_penalty` to `configs/config.yaml` (default: `0.001`) to control the strength of this penalty).
+
+Rationale:
+- This change is designed to combat "bloat," where genetic algorithms produce increasingly complex solutions without a corresponding improvement in performance. By penalizing complexity, the system is incentivized to discover simpler, more robust, and more efficient alphas. This is expected to significantly improve the quality of discovered strategies and the overall speed of the discovery cycle.
+
+Verification Checklist:
+- [ ] Confirm the new `discovery.fitness_weights.complexity_penalty` key is present in `configs/config.yaml`.
+- [ ] The system continues to generate and promote new alphas. The rate of promotion may change as the system adapts to the new fitness landscape.
+
+Rollback:
+- To disable this feature, set `discovery.fitness_weights.complexity_penalty: 0.0` in `configs/config.yaml`.
+
+## 2025-08-27 Critical Bug Fixes & Configuration Restoration
+
+Changes:
+- **EIL Backtest Logic Fix:** Corrected a fatal `AttributeError` in `v26meme/labs/hyper_lab.py` where the backtest result (a pandas DataFrame from `SimLab`) was incorrectly processed as a dictionary. This bug was the primary cause of zero EIL output and promotions.
+- **Startup Crash Fix:** Resolved a silent startup crash caused by a missing or incomplete `screener` configuration block in `configs/config.yaml`. The application now validates the configuration schema on load, preventing `KeyError` or `ValidationError` exceptions before the main loop's error handling is active.
+- **Granular Validation Telemetry:** Implemented the planned enhancement to `v26meme/research/validation.py` to return specific rejection reasons (`min_trades`, `fdr`, `dsr`). The `hyper_lab` now consumes and logs this telemetry, resolving the "opaque validation gate" issue.
+
+Rationale:
+- These changes address critical, blocking bugs identified during a root cause analysis of the EIL pipeline. The fixes unblock the core alpha discovery loop and restore essential diagnostic capabilities for systematic performance tuning.
+
+Verification Checklist:
+- [ ] Application starts without crashing.
+- [ ] EIL cycles run without `AttributeError` in logs.
+- [ ] Redis key `eil:rej:counts` is populated with granular reasons (e.g., `fdr_stage_relaxed`, `dsr_stage_relaxed`).
+- [ ] `SURVIVOR` and `PROMOTED` logs appear after sufficient cycles.
+
+Rollback:
+- Reverting these changes is not recommended as they fix fundamental bugs.
+
 ## 2025-08-19 Alpha Registry Hygiene (Dedup + Retro Gates + Padding Trim)
 
 Changes:
@@ -793,6 +849,143 @@ Risks / Mitigations:
 - Overly aggressive robustness threshold may reject too many candidates → lower `min_robust_score` (e.g. 0.45) temporarily.
 - High PBO without action: expand panel symbols or increase window days to deepen sample before relaxing gates.
 
-Monitoring:
-- Track trend of `eil:pbo:last.pbo`; aim for stability <0.25 over successive generations.
-- Observe survivor density vs. pre-robustness baseline; adjust gates to balance throughput.
+## 2025-08-23 Config Reconciliation (PBO Gate, Unified Bounds, Robust Promotion)
+
+Changes:
+- promotion_criteria.min_trades 30→40 (aligned with tight gate stage).
+- Added promotion_criteria.min_robust_score=0.55 (mirrors prober.min_robust_score).
+- Added discovery.pbo_max_accept=0.65 (batch overfit suppression when PBO exceeds threshold).
+- Introduced discovery.population_bounds {min:120,max:400} as single source for evolutionary size caps.
+- Marked discovery.max_population_size & adaptive.population_size_min/max for deprecation (kept for backward compat this release).
+
+Operational Impact:
+- Prevents premature promotion below final gate trade depth.
+- Ensures robustness consistency between probing and promotion.
+- Adds proactive overfitting brake; high PBO generations no longer silently promote.
+- Clarifies population scaling boundaries reducing conflicting expansions.
+
+Actions Required:
+- Update any automation referencing adaptive.population_size_min/max to use discovery.population_bounds.*.
+- Monitor Redis key eil:pbo:last; if PBO frequently >0.65, increase panel breadth or window length before relaxing threshold.
+
+Verification Checklist:
+- [ ] Promotion logs show no candidates with trades < 40 promoted.
+- [ ] Rejections include 'robust_stage_' prior to promotion for fragile formulas.
+- [ ] When eil:pbo:last.pbo > 0.65 cycle shows suppression (no promotions even if gates passed).
+- [ ] Population never exceeds 400 unless bounds adjusted.
+
+Rollback:
+- Revert promotion_criteria.min_trades to previous value (30) if throughput collapse (ensure survivor_density < target before rollback).
+- Remove pbo_max_accept to disable overfit gate (not recommended).
+- Delete population_bounds block to restore legacy separate limits.
+
+Risk & Mitigation:
+- Higher min_trades may slow early survivor telemetry; mitigate by modestly increasing fast_window_days or panel_symbols.
+- PBO gate could suppress all promotions under extreme data scarcity; mitigate by adding symbols or lengthening lookback.
+
+## 2025-08-23 Incremental Harvest + Promotion Reactivation
+
+Changes:
+- harvester.partial_harvest false→true (rotational timeframe coverage restored).
+- harvester.aggregate_timeframes.enabled false→true (synthetic 5m→1h aggregation back online for timely higher TF features).
+- harvester.checkpoint_reconcile.enabled false→true (forward drift correction reinstated to prevent lagged checkpoints starving aggregation).
+- discovery.max_promotions_per_cycle 0→1 and max_promotions_per_day 0→3 (controlled survivor flow in paper mode).
+- discovery.debug_relaxed_gates true→false (return to configured staged gates for statistical rigor).
+- risk.max_consecutive_errors 12→8 (start tightening sandbox leniency; further reduction pending stability).
+
+Rationale:
+- Accelerate panel depth and strategy evaluability while maintaining PIT safety (forward-only reconcile, closed-bar aggregation).
+- Introduce limited promotions to exercise allocation/risk paths and gather realized performance telemetry.
+- Remove relaxed gating crutch to obtain true survivor density / rejection distribution under production-like thresholds.
+
+Operational Checklist:
+- [ ] Next cycles show `[harvest] coverage_summary` with rotating timeframes (partial harvest index increments).
+- [ ] Aggregation logs present (`[harvest] aggregated_timeframes built` or skips with native_ok=true).
+- [ ] `eil:gate:diagnostic.survivor_density` stabilizes ≥ 0.05 in relaxed stage; promotions log `PROMOTED` entries (paper only).
+- [ ] No checkpoint drift > 1 bar after reconcile (inspect `harvest:checkpoint_reconcile:last`).
+- [ ] No increase in `risk:halted`; error streaks < 8.
+
+Rollback:
+- Set partial_harvest=false, aggregate_timeframes.enabled=false, checkpoint_reconcile.enabled=false to return to static bootstrap mode.
+- Reset promotions to zero caps if overfitting risk spikes (e.g., sudden PBO > pbo_max_accept with promotions pending).
+- Re-enable debug_relaxed_gates if survivor density collapses (<0.01 for 5+ cycles) while tuning.
+
+Risk Mitigations:
+- PBO gate (pbo_max_accept=0.65) prevents overfit batch promotion surge.
+- Robustness and DSR gates remain active; promotion_criteria min_trades raised to 40 reduces premature capital assignment.
+- Forward-only reconcile ensures no retroactive history edits (PIT invariant preserved).
+
+## 2025-08-26 Screener Configuration Restoration
+
+Changes:
+- Added the `screener` block to `configs/config.yaml` with default parameters for volume, spread, and impact, resolving the critical `Universe screening failed` error.
+
+Rationale:
+- The screener configuration was missing, causing a fatal error in every loop cycle and preventing the EIL from receiving a symbol universe. This restoration unblocks the primary pipeline.
+
+## 2025-08-26 EIL Reactivation (Exit Single-Symbol Sandbox)
+
+Changes:
+- Restored full `harvester.core_symbols` list (18 symbols) and set `harvester.restrict_single_symbol=false`, `harvester.dynamic_enabled=true`.
+- Re-enabled `harvester.aggregate_timeframes` and `harvester.checkpoint_reconcile` to restore full data pipeline functionality.
+- Re-enabled alpha promotions by setting `discovery.max_promotions_per_cycle=1` and `discovery.max_promotions_per_day=5`.
+- Restored `discovery.panel_symbols` to 10 and `min_panel_symbols` to 5.
+- Implemented composite fitness function and stagnation handling in `v26meme/research/generator.py` as per the planned evolution in note `2025-08-22`.
+
+Rationale:
+- The single-symbol data-plane validation phase is complete. The system is now transitioning to full, multi-symbol discovery mode to begin generating and compounding new alphas as per the prime directive.
+
+Operational Checklist:
+- [ ] Verify `[panel_coverage]` logs show `symbols_eligible` increasing beyond 1.
+- [ ] Monitor Redis for `PROMOTED` log entries and confirm `portfolio:alpha_weights` is populated.
+- [ ] Observe `eil:gate:stage` telemetry to ensure staged gates are active.
+- [ ] Confirm `eil:rej:counts` telemetry reflects a healthy distribution of rejections, not dominated by coverage issues.
+
+## Added `prober.mdd_escalation_multiplier` (v4.7.5 relax robustness gate)
+- New config knob replaces previously hardcoded MDD escalation multiplier (was 1.25) inside `FeatureProber`.
+- Default set to 1.50 to modestly increase survivor admissions while still filtering extreme drawdown sensitivity.
+- To revert to prior strict behavior set `prober.mdd_escalation_multiplier: 1.25` in `configs/config.yaml`.
+- No interface changes; only configuration. Tests updated (`test_feature_prober_robust.py`).
+
+## 2025-08-26 TEMP EIL Loosened Gates (Survivor Bootstrapping)
+- Temporarily relaxed discovery/validation knobs to obtain initial survivor set:
+  - discovery.generations_per_cycle 3→5
+  - discovery.cv_folds 10→5
+  - discovery.cv_embargo_bars 288→96
+  - discovery.fdr_alpha 0.20→0.25
+  - validation.dsr.min_prob 0.50→0.40
+  - eil.fast_window_days 75→100
+  - eil.max_cycles 10→20
+- Rationale: Increase trade sample & reduce early statistical friction (power) without code changes.
+- Revert Plan (after ≥3 distinct survivors promoted over ≥2 days with stable PBO <0.5): restore original values & tighten fdr_alpha/dsr.
+- Risk: Higher false discovery rate transiently; guarded by robustness & later re-tightening.
+
+## 2025-08-26 EIL Logging & Telemetry Hardening (v4.7.6)
+
+Changes:
+- **Critical Rejection Attribution:** Implemented rejection logging at both the statistical validation and robustness prober gates.
+  - `_record_rejection` function is now active and logs failures with stage-specific reasons (e.g., `validation_stage_relaxed`, `robust_stage_tight`) to Redis key `eil:rej:counts`.
+  - New log lines `EIL_GATE_REJECT` provide a summary of rejected/passed counts per gate.
+- **Survivor Logging:** Enhanced survivor logs to be explicit and auditable.
+  - New `SURVIVOR` log line created for each unique survivor per cycle, containing its `fid`, `sharpe`, `pval`, `dsr`, `robust_score`, `trades`, and full JSON `formula`.
+  - Replaced vague `EIL_CYCLE_SURVIVORS` with `EIL_CYCLE_SURVIVORS_FOUND` for clarity.
+- **Coverage & Panel Transparency:** Added detailed logging for the data selection phase.
+  - `EIL_COVERAGE_FAIL` log now explicitly states when no timeframe meets coverage criteria.
+  - `EIL_PANEL_SELECT` log provides a per-cycle summary of the chosen timeframe, number of eligible symbols, and final panel size.
+- **Gate Staging Visibility:**
+  - Added `EIL_STAGE_ESCALATE` log to clearly announce when and why the gate stage has been upgraded, including the metrics that triggered the transition.
+
+Rationale:
+- Addresses the top-ranked findings from the recent logging audit. These changes directly fix the opaque failure modes, making the EIL's decision-making process transparent and auditable. This is the highest-impact change to restore diagnostic capability and unblock systematic tuning.
+
+Operational Impact:
+- **High:** Log volume will increase, but with high-signal information.
+- `eil:rej:counts` in Redis will now be populated, enabling adaptive tuning and targeted debugging.
+- `system.log` will contain a clear, traceable record of every survivor and every major filtering event, allowing for deterministic replay and audit.
+- Root cause analysis for "no survivors" is now possible by inspecting rejection counts and gate logs.
+
+Verification Checklist:
+- [ ] Run one EIL cycle. `HGETALL eil:rej:counts` in Redis should show non-zero counts for `validation_stage_*` or `robust_stage_*`.
+- [ ] `system.log` should contain `SURVIVOR` lines with full formula details if any candidates pass all gates.
+- [ ] `system.log` should contain `EIL_PANEL_SELECT` and `EIL_GATE_REJECT` lines.
+- [ ] If gate stages are configured to escalate, an `EIL_STAGE_ESCALATE` log should appear.

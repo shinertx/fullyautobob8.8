@@ -92,7 +92,7 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
                    alpha_fdr: float,
                    cv_method: str = "kfold",
                    sparse_fallback: Optional[Dict[str, Union[int,float]]] = None,
-                   bootstrap: Optional[Dict[str, Union[int,float,str,bool]]] = None) -> Dict[str, Union[float,int]]:
+                   bootstrap: Optional[Dict[str, Union[int,float,str,bool]]] = None) -> Dict[str, Union[float,int,bool]]:
     """Aggregate panel cross-validation statistics with purged / combinatorial folds.
 
     Enhancements:
@@ -100,100 +100,95 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
       - Retains sparse win-rate binomial fallback logic.
     All operations PIT-safe (closed-bar realized returns only).
     """
-    all_oos: List[pd.Series] = []
-    total_trades = 0
-    wins = 0
-    for _sym, s in panel_returns.items():
-        s = s.dropna()
-        if s.empty or len(s) < max(20, k_folds*5):
-            continue
-        n = len(s)
-        total_trades += n
-        wins += int((s > 0).sum())
-        folds = purged_kfold_indices(n, k_folds, embargo)
-        if cv_method and str(cv_method).lower() == "cpcv" and k_folds > 1:
-            comb_folds = []
-            for i in range(k_folds):
-                for j in range(i+1, k_folds):
-                    test_idx = np.unique(np.concatenate([folds[i][1], folds[j][1]]))
-                    train_mask = np.ones(n, dtype=bool)
-                    emb_lo_i = max(0, folds[i][1][0] - embargo); emb_hi_i = min(n, folds[i][1][-1] + 1 + embargo)
-                    train_mask[emb_lo_i:emb_hi_i] = False
-                    emb_lo_j = max(0, folds[j][1][0] - embargo); emb_hi_j = min(n, folds[j][1][-1] + 1 + embargo)
-                    train_mask[emb_lo_j:emb_hi_j] = False
-                    train_mask[test_idx] = False
-                    comb_folds.append((np.where(train_mask)[0], test_idx))
-            folds_to_use = comb_folds
-        else:
-            folds_to_use = folds
-        oos_chunks = [s.iloc[test_idx] for _, test_idx in folds_to_use]
-        if oos_chunks:
-            all_oos.append(pd.concat(oos_chunks))
-    if not all_oos:
-        return {"p_value": 1.0, "mean_oos": 0.0, "n": 0}
-    all_oos_concat = pd.concat(all_oos)
-    # Normalize to Series of floats deterministically
-    if isinstance(all_oos_concat, pd.DataFrame):
-        if all_oos_concat.shape[1] == 1:
-            all_oos_concat = all_oos_concat.iloc[:, 0]  # type: ignore[index]
-        else:
-            all_oos_concat = all_oos_concat.mean(axis=1)  # type: ignore[arg-type]
-    if not isinstance(all_oos_concat, pd.Series):  # final guard
-        try:
-            all_oos_concat = pd.Series(all_oos_concat)
-        except Exception:
-            return {"p_value": 1.0, "mean_oos": 0.0, "n": 0}
-    all_oos_concat = pd.to_numeric(all_oos_concat, errors='coerce').dropna()
-    if all_oos_concat.empty:
-        return {"p_value": 1.0, "mean_oos": 0.0, "n": 0}
-    n_total = int(all_oos_concat.shape[0])
-    std_val = float(all_oos_concat.std(ddof=1)) if n_total > 1 else 0.0
+    all_returns_list = [s for s in panel_returns.values() if not s.empty]
+    if not all_returns_list:
+        return {"p_value": 1.0, "mean_oos": 0.0, "sharpe_oos": 0.0, "total_trades": 0, "is_fallback": True}
 
-    # Decide p-value computation path
-    p: float = 1.0
-    use_bootstrap = False
-    if bootstrap and bool(bootstrap.get('enabled', True)):
-        min_bt = int(bootstrap.get('min_trades', 60))
-        if n_total < min_bt:
-            use_bootstrap = True
-    if std_val == 0.0 or n_total < 5:
-        p = 1.0
-    elif use_bootstrap and bootstrap:
-        n_iter = int(bootstrap.get('n_iter', 500))
-        seed = int(bootstrap.get('seed', 1337))
-        method = str(bootstrap.get('method', 'basic'))
-        p = _bootstrap_p_value(all_oos_concat, n_iter=n_iter, seed=seed, method=method)
-    else:
-        # One-sided t-test (greater than 0 mean)
-        stat_val, p_raw = ttest_1samp(all_oos_concat, popmean=0.0, alternative='greater')
-        try:
-            if isinstance(p_raw, (float, int, np.floating, np.integer)):
-                p = float(p_raw)
-            elif hasattr(p_raw, 'shape') and getattr(p_raw, 'size', 0) > 0:
-                p = float(np.asarray(p_raw).flat[0])
-            elif isinstance(p_raw, (list, tuple)) and p_raw:
-                p = float(p_raw[0])
+    all_returns = pd.concat(all_returns_list).sort_index()
+    n = len(all_returns)
+    
+    if n < k_folds:
+        # Not enough data for even one fold, use fallback for the whole series
+        p_final = 1.0
+        if n > 0:
+            sfb = sparse_fallback or {}
+            min_trades_for_ttest = sfb.get("min_trades_for_ttest", 5)
+            if n < min_trades_for_ttest:
+                wins = (all_returns > 0).sum()
+                p_final = _binomial_p_two_sided(wins, n)
             else:
-                p = 1.0
-        except Exception:
-            p = 1.0
+                t_stat, p_val = ttest_1samp(all_returns, 0)
+                p_final = p_val / 2.0 if t_stat > 0 else 1.0 - (p_val / 2.0)
+        
+        mean_ret = float(all_returns.mean()) if not all_returns.empty else 0.0
+        std_ret = float(all_returns.std()) if not all_returns.empty and all_returns.std() > 0 else 1.0
+        return {
+            "p_value": p_final,
+            "mean_oos": mean_ret,
+            "sharpe_oos": mean_ret / std_ret,
+            "total_trades": n,
+            "is_fallback": True,
+        }
 
-    # Sparse fallback (win-rate binomial) if configured
-    if sparse_fallback and total_trades > 0:
-        min_tr = int(sparse_fallback.get('min_trades', 25))
-        p_gate = sparse_fallback.get('p_gate', 0.95)
-        try:
-            p_gate_f = float(p_gate) if not isinstance(p_gate, bool) else 0.95
-            if 1 < p_gate_f <= 100:
-                p_gate_f /= 100.0
-        except Exception:
-            p_gate_f = 0.95
-        if total_trades < min_tr and p >= p_gate_f:
-            p_bin = _binomial_p_two_sided(wins, total_trades, p=0.5)
-            p = min(p, p_bin)
+    indices = purged_kfold_indices(n=n, k=k_folds, embargo=embargo)
+    
+    oos_p_values = []
+    oos_means = []
+    oos_sharpes = []
+    total_oos_trades = 0
 
-    mean_val = float(all_oos_concat.mean()) if n_total else 0.0
-    return {"p_value": p, "mean_oos": mean_val, "n": n_total}
+    for train_idx, test_idx in indices:
+        # train_returns = all_returns.iloc[train_idx].dropna() # train data not used for p-value
+        test_returns = all_returns.iloc[test_idx].dropna()
+        total_oos_trades += len(test_returns)
+
+        if len(test_returns) >= 2:
+            t_stat, p_val = ttest_1samp(test_returns, 0)
+            # One-sided test: H1 is that mean > 0
+            p_val = p_val / 2.0 if t_stat > 0 else 1.0 - (p_val / 2.0)
+            oos_p_values.append(p_val)
+            oos_means.append(test_returns.mean())
+            oos_sharpes.append(test_returns.mean() / test_returns.std() if test_returns.std() > 0 else 0)
+
+    # Fallback for sparse trade series where CV is not meaningful
+    if not oos_p_values:
+        sfb = sparse_fallback or {}
+        min_trades_for_ttest = sfb.get("min_trades_for_ttest", 5)
+        if len(all_returns) < min_trades_for_ttest:
+            wins = (all_returns > 0).sum()
+            p_final = _binomial_p_two_sided(wins, len(all_returns))
+        else:
+            # Bootstrap p-value for series that are too short for CV but not extremely sparse
+            if bootstrap and bootstrap.get("enabled"):
+                p_final = _bootstrap_p_value(
+                    all_returns,
+                    n_iter=int(bootstrap.get("n_iter", 500)),
+                    seed=int(bootstrap.get("seed", 1337)),
+                    method=str(bootstrap.get("method", "basic")),
+                )
+            else:
+                # Default to t-test on full sample if bootstrap is off
+                t_stat, p_val = ttest_1samp(all_returns, 0)
+                p_final = p_val / 2.0 if t_stat > 0 else 1.0 - (p_val / 2.0)
+
+        mean_ret = float(all_returns.mean()) if not all_returns.empty else 0.0
+        std_ret = float(all_returns.std()) if not all_returns.empty and all_returns.std() > 0 else 1.0
+        return {
+            "p_value": p_final,
+            "mean_oos": mean_ret,
+            "sharpe_oos": mean_ret / std_ret,
+            "total_trades": len(all_returns),
+            "is_fallback": True,
+        }
+
+    p_final = float(np.mean(oos_p_values)) if oos_p_values else 1.0
+    return {
+        "p_value": p_final,
+        "mean_oos": float(np.mean(oos_means)) if oos_means else 0.0,
+        "sharpe_oos": float(np.mean(oos_sharpes)) if oos_sharpes else 0.0,
+        "total_trades": total_oos_trades,
+        "is_fallback": False,
+    }
 
 def deflated_sharpe_ratio(returns: pd.Series, n_trials: int, sr_benchmark: float = 0.0) -> float:
     """Approximate Deflated Sharpe Ratio probability (Bailey & Lopez de Prado).
@@ -285,3 +280,101 @@ def compute_pbo(per_symbol_perf: Dict[str, Dict[str, float]], *, num_splits: int
     if valid == 0:
         return 0.0
     return float(overfit / valid)
+
+class Validator:
+    """
+    Encapsulates the full alpha validation pipeline, including cross-validation,
+    False Discovery Rate control, and Deflated Sharpe Ratio analysis.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.cv_folds = int(config.get('cv_folds', 5))
+        self.cv_embargo = int(config.get('cv_embargo_bars', 5))
+        self.fdr_alpha = float(config.get('fdr_alpha', 0.1))
+        self.dsr_cfg = config.get('dsr', {})
+        self.dsr_enabled = bool(self.dsr_cfg.get('enabled', True))
+        self.dsr_bench = float(self.dsr_cfg.get('benchmark_sr', 0.0))
+        self.dsr_min_prob = float(self.dsr_cfg.get('min_prob', 0.5))
+        self.bootstrap_cfg = config.get('bootstrap', {})
+        self.min_trades_gate = int(config.get('min_trades', 20))
+
+    def validate_batch(self, evaluated_alphas: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+        """
+        Applies the full validation suite to a batch of evaluated alpha candidates.
+        Returns a tuple: (list_of_survivors, dict_of_rejections).
+        """
+        if not evaluated_alphas:
+            return [], {}
+
+        rejections: Dict[str, List[str]] = {
+            "min_trades": [], "fdr": [], "dsr": []
+        }
+        
+        pvals, fids, formula_stats = [], [], {}
+
+        for alpha in evaluated_alphas:
+            fid = alpha.get('alpha_id')
+            trades_df = alpha.get('trades')
+            
+            if trades_df is None or trades_df.empty or 'pnl' not in trades_df:
+                if fid: rejections["min_trades"].append(fid)
+                continue
+
+            total_trades = len(trades_df)
+            if total_trades < self.min_trades_gate:
+                if fid: rejections["min_trades"].append(fid)
+                continue
+
+            panel_returns = {'panel': trades_df['pnl']}
+            
+            cv_res = panel_cv_stats(
+                panel_returns,
+                k_folds=self.cv_folds, embargo=self.cv_embargo,
+                alpha_fdr=self.fdr_alpha, bootstrap=self.bootstrap_cfg
+            )
+            
+            p_val = float(cv_res.get('p_value', 1.0))
+            
+            all_returns = trades_df['pnl']
+            dsr_prob = deflated_sharpe_ratio(all_returns, n_trials=len(evaluated_alphas), sr_benchmark=self.dsr_bench) if self.dsr_enabled else 1.0
+            
+            if fid:
+                pvals.append(p_val)
+                fids.append(fid)
+                formula_stats[fid] = {
+                    'p_value': p_val, 'dsr_prob': dsr_prob, 'n_trades': total_trades,
+                    'sharpe': alpha.get('sharpe'), 'formula': alpha.get('formula'),
+                    'returns': all_returns.tolist()
+                }
+
+        if not pvals:
+            return [], rejections
+
+        flags, _ = benjamini_hochberg(pvals, self.fdr_alpha)
+        
+        final_survivors = []
+        for fid, flag in zip(fids, flags):
+            stats = formula_stats.get(fid, {})
+            
+            if not flag:
+                rejections["fdr"].append(fid)
+                continue
+
+            if self.dsr_enabled and stats.get('dsr_prob', 0.0) < self.dsr_min_prob:
+                rejections["dsr"].append(fid)
+                continue
+            
+            survivor = {
+                'alpha_id': fid, # Changed 'fid' to 'alpha_id' to match hyper_lab
+                'formula': stats.get('formula'),
+                'sharpe': stats.get('sharpe', 0.0),
+                'p_value': stats.get('p_value', 1.0),
+                'dsr_prob': stats.get('dsr_prob', 0.0),
+                'n_trades': stats.get('n_trades', 0),
+                'returns': stats.get('returns', []),
+                'universe': self.config.get('universe', []),
+                'timeframe': self.config.get('timeframe', '1h'),
+            }
+            final_survivors.append(survivor)
+            
+        return final_survivors, rejections

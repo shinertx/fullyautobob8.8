@@ -1,12 +1,14 @@
+from typing import List, Dict, Any
 from loguru import logger
 import numpy as np
+from v26meme.core.dsl import Alpha
 from v26meme.registry.canonical import venue_symbol_for
 
 from v26meme.execution.micro_live import MicroLive
 
 class ExecutionHandler:
     def __init__(self, state, exchange_factory, cfg, risk_manager=None):
-        self.state, self.cfg = state, cfg['execution']
+        self.state, self.root_cfg, self.cfg = state, cfg, cfg['execution']
         self.exchange = exchange_factory.get_exchange(self.cfg['primary_exchange'])
         self.risk = risk_manager
         try: self.exchange.load_markets()
@@ -18,6 +20,10 @@ class ExecutionHandler:
         ml_cfg = cfg.get('micro_live', {}) or {}
         self.micro = MicroLive(self.exchange, ml_cfg.get('notional_usd', 3.0),
                                ml_cfg.get('cycle_budget_trades', 5), ml_cfg.get('enabled', False))
+
+    def get_portfolio(self):
+        """Returns the current portfolio state."""
+        return self.state.get_portfolio()
 
     def _ex_symbol(self, canonical):
         return venue_symbol_for(self.exchange, canonical)
@@ -47,8 +53,35 @@ class ExecutionHandler:
         except Exception: pass
         return usd_value <= self.max_order
 
-    def reconcile(self, target_weights: dict, active_alphas: list):
+    def reconcile(self, target_weights: dict, active_alphas: List[Alpha]):
         logger.info("Reconciliation cycle initiated...")
+
+        # Check for an active ensemble definition first
+        ensemble_def = self.state.get_ensemble_definition()
+        if ensemble_def and self.root_cfg.get('ensemble', {}).get('enabled', False):
+            logger.success("Ensemble definition found. Trading based on meta-alpha.")
+            
+            # Create a map of all active alphas by ID for quick lookup
+            alpha_map = {a.id: a for a in active_alphas}
+            
+            # Calculate symbol targets based on the ensemble weights
+            symbol_target = {}
+            for alpha_id, weight in ensemble_def.get('weights', {}).items():
+                component_alpha = alpha_map.get(alpha_id)
+                if not component_alpha or not component_alpha.universe:
+                    continue
+                
+                # Assuming one symbol per alpha for now
+                symbol = component_alpha.universe[0]
+                symbol_target[symbol] = symbol_target.get(symbol, 0.0) + float(weight)
+        else:
+            # Fallback to standard target weights if no ensemble is active
+            alpha_to_symbol = {a.id: a.universe[0] for a in active_alphas if a.universe}
+            symbol_target = {}
+            for aid, w in (target_weights or {}).items():
+                sym = alpha_to_symbol.get(aid)
+                if not sym: continue
+                symbol_target[sym] = symbol_target.get(sym, 0.0) + float(w)
 
         cap = self.state.get('risk:current_max_order')
         if cap is not None:
@@ -58,13 +91,6 @@ class ExecutionHandler:
         portfolio = self.state.get_portfolio()
         cash = float(portfolio.get('cash', 0.0))
         positions = dict(portfolio.get('positions', {}))
-
-        alpha_to_symbol = {a['id']: a['universe'][0] for a in active_alphas}
-        symbol_target = {}
-        for aid, w in (target_weights or {}).items():
-            sym = alpha_to_symbol.get(aid)
-            if not sym: continue
-            symbol_target[sym] = symbol_target.get(sym, 0.0) + float(w)
 
         equity_mark = cash
         price_cache = {}
@@ -103,7 +129,14 @@ class ExecutionHandler:
                 if not ex_sym: continue
                 px = price_cache.get(sym, 0.0)
                 if px <= 0.0: continue
-                target_usd = equity_mark * w
+                
+                # Use dynamic position sizing if available
+                if self.risk and 'get_dynamic_position_size' in dir(self.risk):
+                    target_asset_qty = self.risk.get_dynamic_position_size(sym, px, equity_mark)
+                    target_usd = target_asset_qty * px * np.sign(w) # Use weight's sign for direction
+                else:
+                    target_usd = equity_mark * w
+
                 cur_amt = float(positions.get(sym, {}).get('amount', 0.0))
                 cur_usd = cur_amt * px
                 delta_usd = target_usd - cur_usd
@@ -162,8 +195,13 @@ class ExecutionHandler:
                     self.state.set("slippage:table", table)
 
             if self.micro.enabled:
-                insts = [a.get('instrument') for a in active_alphas if a.get('instrument')]
-                if insts: self.micro.sample(insts, _record)
+                screener_payload = self.state.get("data:screener:latest")
+                insts = []
+                if screener_payload and isinstance(screener_payload, dict):
+                    insts = screener_payload.get("universe", [])
+                
+                if insts:
+                    self.micro.sample(insts, _record)
             return
 
         if self.cfg['mode'] == 'live':

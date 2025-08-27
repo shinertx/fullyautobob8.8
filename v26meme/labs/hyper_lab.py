@@ -1,20 +1,21 @@
 import time, json, random, hashlib
 import os
-import click, yaml
+import yaml
 import pandas as pd
 import numpy as np
 from loguru import logger
 from pathlib import Path
 import math  # FIX: for activation_gain exp (replaces deprecated pd.np)
+import click
 
 from v26meme.core.state import StateManager
 from v26meme.data.lakehouse import Lakehouse
 from v26meme.research.feature_factory import FeatureFactory
 from v26meme.research.generator import GeneticGenerator  # updated: adaptive generator w/ feature stats
 from v26meme.labs.simlab import SimLab
-from v26meme.research.validation import panel_cv_stats, deflated_sharpe_ratio, benjamini_hochberg, compute_pbo
+from v26meme.research.validation import Validator
 from v26meme.research.feature_prober import FeatureProber
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 
 # Stage helper functions (ensure defined before run_eil)
 
@@ -49,13 +50,14 @@ def _maybe_escalate_stage(state: StateManager, cycle_idx: int, current_stage: st
         stage_history.append({'stage': current_stage, 'cycle': cycle_idx, 'survivor_density': survivor_density, 'median_trades': median_trades})
         recent = [h for h in stage_history if h['stage'] == current_stage]
         if len(recent) >= patience and idx < len(stage_order)-1:
+            old_stage = current_stage
             current_stage = stage_order[idx+1]
+            logger.success(f"EIL_STAGE_ESCALATE from={old_stage} to={current_stage} cycle={cycle_idx} density={survivor_density:.3f} trades={median_trades:.1f}")
             state.set('eil:gate:stage', current_stage)
             stage_history.append({'stage': current_stage, 'cycle': cycle_idx, 'transition': True})
     state.set('eil:gate:history', stage_history)
     return current_stage, stage_history
 
-# NEW: helper to apply single-symbol restriction
 def _maybe_restrict_single_symbol(cfg: dict, symbols: List[str]) -> List[str]:
     harv = cfg.get('harvester', {})
     core = harv.get('core_symbols') or []
@@ -126,6 +128,17 @@ def _sleep(seconds: int) -> None:
         return
     time.sleep(seconds)
 
+def _record_rejection(state: StateManager, reason: str, fid: str) -> None:
+    rc = state.get('eil:rej:counts') or {}
+    rc[reason] = int(rc.get(reason,0)) + 1
+    state.set('eil:rej:counts', rc)
+    # sample FIDs per reason (bounded)
+    sample_key = f'eil:rej:samples:{reason}'
+    samples = state.get(sample_key) or []
+    if len(samples) < 25:
+        samples.append(fid)
+        state.set(sample_key, samples)
+
 @click.group()
 def cli(): pass
 
@@ -133,7 +146,7 @@ def cli(): pass
 def run():  # Plain function for programmatic/test use
     run_eil()
 
-def run_eil(cfg: Dict[str, Any] | None = None) -> None:
+def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """Execute one or more Evolutionary Iteration Loop (EIL) cycles.
 
     This is the programmatic (non-Click) entrypoint used by tests to avoid Click
@@ -166,26 +179,37 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> None:
 
     lake = Lakehouse(preferred_exchange=cfg["execution"]["primary_exchange"])
     ff = FeatureFactory()
-    sim = SimLab(cfg['execution']['paper_fees_bps'], cfg['execution']['paper_slippage_bps'],
-                 slippage_table=(state.get("slippage:table") or {}),
-                 max_holding_bars=int(cfg['execution'].get('max_holding_bars', 0) or 0) or None)
+    sim = SimLab()
+    
+    # Validator setup
+    validator_config = cfg.get('validation', {}).copy()
+    # Override with discovery CV params if present
+    validator_config['cv_folds'] = cfg['discovery'].get('cv_folds', validator_config.get('cv_folds', 5))
+    validator_config['cv_embargo_bars'] = cfg['discovery'].get('cv_embargo_bars', validator_config.get('cv_embargo_bars', 5))
+    validator_config['fdr_alpha'] = cfg['discovery'].get('fdr_alpha', validator_config.get('fdr_alpha', 0.1))
+    validator = Validator(validator_config)
 
     prober_cfg = cfg.get('prober', {})
-    prober_enabled = bool(prober_cfg.get('enabled', True))
-    feature_prober = FeatureProber(cfg['execution']['paper_fees_bps'], cfg['execution']['paper_slippage_bps'], perturbations=int(prober_cfg.get('perturbations',64)), delta_fraction=float(prober_cfg.get('delta_fraction',0.15)))
+    feature_prober: Optional[FeatureProber] = None
+    if prober_cfg.get('enabled', True):
+        fees_decimal = cfg['execution']['paper_fees_bps'] / 10000.0
+        slippage_decimal = cfg['execution']['paper_slippage_bps'] / 10000.0
+        feature_prober = FeatureProber(
+            fee_pct=fees_decimal, 
+            slippage_pct=slippage_decimal, 
+            perturbations=int(prober_cfg.get('perturbations',64)), 
+            delta_fraction=float(prober_cfg.get('delta_fraction',0.15)),
+            mdd_escalation_multiplier=float(prober_cfg.get('mdd_escalation_multiplier', 1.25))
+        )
 
-    base_features = ['return_1p','volatility_20p','momentum_10p','rsi_14','close_vs_sma50',
-                     'hod_sin','hod_cos','round_proximity','btc_corr_20p','eth_btc_ratio','beta_btc_20p']
+    base_features = cfg['discovery'].get("base_features", [])
+    if not base_features:
+        raise ValueError("`discovery.base_features` not found in config or is empty.")
+
     # Coverage gating parameters (avoid magic numbers by sourcing config)
     min_panel_symbols = int(cfg['discovery'].get('min_panel_symbols', 3))
     min_bars_per_symbol = int(cfg['discovery'].get('min_bars_per_symbol', 100))
     timeframe_preference = ['1h','15m','5m']  # higher frequency fallback later if higher tf unseeded
-
-    tf_selected, eligible_symbols, bars_map = _select_timeframe(cfg, lake, min_bars_per_symbol, min_panel_symbols, timeframe_preference)
-    # Log if narrowing applied
-    harv_cfg = cfg.get('harvester', {})
-    if harv_cfg.get('restrict_single_symbol'):
-        logger.info(f"EIL_SINGLE_SYMBOL_MODE core_symbols={harv_cfg.get('core_symbols')} eligible_after_narrow={len(eligible_symbols)}")
 
     gen = GeneticGenerator(base_features, population_size=cfg['discovery']['population_size'], seed=cfg['system'].get('seed', 1337))
     # Warm start population if persisted
@@ -200,151 +224,51 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> None:
     except Exception:
         pass
 
-    # ---------------- inner helpers (promotion unchanged) ----------------
-    def _promote_survivors(candidates: Dict[str, Dict[str, Any]], panel_syms: List[str]):
-        if not candidates:
-            return 0
-        active = state.get_active_alphas()
-        existing_ids = {a.get('id') for a in active}
-        day_key = time.strftime('%Y%m%d', time.gmtime())
-        day_count_key = f"eil:promotions:day:{day_key}"
-        day_count_raw = state.get(day_count_key)
-        try: day_count = int(day_count_raw) if day_count_raw is not None else 0
-        except Exception: day_count = 0
-        promoted = 0
-        for key, payload in sorted(candidates.items(), key=lambda kv: kv[1].get('score',0), reverse=True):
-            if max_promotions_cycle and promoted >= max_promotions_cycle: break
-            if max_promotions_day and day_count >= max_promotions_day: break
-            fid_val = payload.get('fid')
-            if not isinstance(fid_val, str): continue
-            fid = fid_val
-            if fid in existing_ids: continue
-            alpha = {
-                'id': fid,
-                'name': f"eil_{fid[:8]}",
-                'formula': payload.get('formula'),
-                'universe': panel_syms,
-                'timeframe': tf_selected,
-                'lane': 'moonshot',
-                'performance': {}
-            }
-            active.append(alpha)
-            existing_ids.add(fid)
-            promoted += 1
-            day_count += 1
-        if promoted:
-            state.set_active_alphas(active)
-            state.set(day_count_key, day_count)
-            logger.info(f"PROMOTED {promoted} survivors -> active_alphas (day_total={day_count})")
-        return promoted
+    # Helper: record first rejection reason per formula - MOVED TO MODULE LEVEL
 
-    def _drain_llm_proposals(max_inject: int) -> int:
-        """Drain hardened LLM proposal queue and append unique formulas to population.
-
-        PIT: Only uses present queue contents; no future leakage. Deterministic insertion order.
-        """
-        r = getattr(state, 'r', None)
-        if r is None: return 0
-        injected = 0
-        seen = set()
-        for f in gen.population:
-            try: seen.add(hashlib.sha256(json.dumps(f, separators=(',',':')).encode()).hexdigest())
-            except Exception: continue
-        max_pop = int(cfg['discovery'].get('max_population_size', len(gen.population)))
-        while injected < max_inject and r.llen('llm:proposals') > 0:
-            raw = r.lpop('llm:proposals')
-            if not raw: break
-            try: f = json.loads(raw)
-            except Exception: continue
-            if not isinstance(f, list) or len(f) < 3: continue
-            h = hashlib.sha256(json.dumps(f, separators=(',',':')).encode()).hexdigest()
-            if h in seen: continue
-            gen.population.append(f)
-            seen.add(h)
-            injected += 1
-            if len(gen.population) > max_pop:
-                drop_n = len(gen.population) - max_pop
-                if drop_n > 0:
-                    gen.population = gen.population[drop_n:]
-        if injected:
-            logger.info(f"LLM_INJECT injected={injected} population={len(gen.population)}")
-        return injected
-
-    # Helper: record first rejection reason per formula
-    def _record_rejection(state: StateManager, reason: str, fid: str) -> None:
-        rc = state.get('eil:rej:counts') or {}
-        rc[reason] = int(rc.get(reason,0)) + 1
-        state.set('eil:rej:counts', rc)
-        # sample FIDs per reason (bounded)
-        sample_key = f'eil:rej:samples:{reason}'
-        samples = state.get(sample_key) or []
-        if len(samples) < 25:
-            samples.append(fid)
-            state.set(sample_key, samples)
-
-    # ---------------- new inner helpers ----------------
-    def _build_panel_cache(panel: List[str], tf_selected: str, nbars_window: int, base_features: List[str], cfg: dict, lake: Lakehouse, ff: FeatureFactory) -> Tuple[Dict[str, pd.DataFrame], Dict[str, list]]:
-        """Build panel dataframe cache & empirical feature stats (quantiles) once per cycle."""
-        df_cache: Dict[str, pd.DataFrame] = {}
-        feat_samples: Dict[str, list] = {f: [] for f in base_features}
-        btc_all = lake.get_data('BTC_USD_SPOT', tf_selected)
-        eth_all = lake.get_data('ETH_USD_SPOT', tf_selected)
-        for canon in panel:
-            raw_df = lake.get_data(canon, tf_selected).tail(nbars_window)
-            if raw_df.empty: continue
-            dff = ff.create(raw_df, symbol=canon, cfg=cfg, other_dfs={'BTC_USD_SPOT': btc_all, 'ETH_USD_SPOT': eth_all})
-            # PREVIOUSLY: unconditional dff = dff.dropna() caused full wipe because early-window feature NaNs.
-            # New: only require core OHLCV columns to be present; allow feature NaNs (handled by feature gating).
-            core_cols = [c for c in ['open','high','low','close','volume'] if c in dff.columns]
-            before_rows = len(dff)
-            if core_cols:
-                dff = dff.dropna(subset=core_cols)
-            after_rows = len(dff)
-            # Optional row-level feature completeness threshold (configurable) – default 0 (disabled)
-            row_min_ratio = float(cfg['discovery'].get('row_min_feature_non_nan_ratio', 0.0))
-            if row_min_ratio > 0:
-                feat_cols = [c for c in base_features if c in dff.columns]
-                if feat_cols:
-                    nn_counts = dff[feat_cols].notna().sum(axis=1)
-                    needed = max(1, int(len(feat_cols) * row_min_ratio))
-                    dff = dff.loc[nn_counts >= needed]
-            if dff.empty:
-                logger.debug(f"EIL_PANEL_DROP canon={canon} emptied rows_before={before_rows} after_core_drop={after_rows}")
-                continue
-            if after_rows and after_rows < before_rows:
-                logger.debug(f"EIL_PANEL_TRIM canon={canon} kept={after_rows}/{before_rows} core_cols={core_cols}")
-            df_cache[canon] = dff
-            # Collect feature samples (head/tail slice to bound memory)
-            for f in base_features:
-                if f in dff:
-                    col = dff[f].dropna()
-                    if not col.empty:
-                        step = max(1, len(col)//50)
-                        feat_samples[f].extend(col.iloc[::step].tolist())
-        return df_cache, feat_samples
-
-    # MAIN EIL LOOP (restored)
+    # MAIN EIL LOOP
+    max_cycles_cfg = int(cfg['eil'].get('max_cycles', 1))
+    all_survivors_from_cycle: List[Dict[str, Any]] = []
     while True:
-        max_cycles_env = int(os.environ.get('EIL_MAX_CYCLES','0') or 0)
-        cycle_idx = int(state.get('eil:cycle_idx') or 0)
-        rel_cycles = cycle_idx - start_idx
-        if max_cycles_env and rel_cycles >= max_cycles_env:
-            logger.info(f"EIL_RELATIVE_COMPLETE rel_cycles={rel_cycles} max={max_cycles_env} start_idx={start_idx} final_cycle_idx={cycle_idx}")
-            break
         try:
+            cycle_idx = int(state.get('eil:cycle_idx') or 0)
+            rel_cycles = cycle_idx - start_idx
+            if rel_cycles >= max_cycles_cfg:
+                logger.info(f"EIL loop complete after {rel_cycles} cycles (max_cycles={max_cycles_cfg}).")
+                break
+
             logger.info(f"EIL_CYCLE_START idx={cycle_idx} rel={rel_cycles} stage={current_stage}")
             # Re-evaluate timeframe & coverage each outer cycle
             tf_selected, eligible_symbols, bars_map = _select_timeframe(cfg, lake, min_bars_per_symbol, min_panel_symbols, timeframe_preference)
             if tf_selected is None:
+                logger.warning(f"EIL_COVERAGE_FAIL: No timeframe met coverage gates. min_symbols={min_panel_symbols} min_bars={min_bars_per_symbol}")
                 state.set('eil:diag:last_reason', f"coverage_gate unmet min_symbols={min_panel_symbols} min_bars={min_bars_per_symbol}")
                 _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1); continue
-            _drain_llm_proposals(max_inject=50)
-            if not eligible_symbols:
-                logger.info("EIL_PANEL_EMPTY eligible_symbols=0"); _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1); continue
+
             panel_universe = [s for s in eligible_symbols if s.endswith('_USD_SPOT')]
-            if not panel_universe:
-                logger.info("EIL_PANEL_EMPTY after _USD_SPOT filter"); _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1); continue
-            panel = random.sample(panel_universe, min(cfg['discovery']['panel_symbols'], len(panel_universe)))
+            panel = random.sample(panel_universe, min(cfg['discovery']['panel_symbols'], len(panel_universe))) if panel_universe else []
+            logger.info(f"EIL_PANEL_SELECT tf={tf_selected} eligible={len(eligible_symbols)} usd_spot_universe={len(panel_universe)} panel_size={len(panel)}")
+            
+            # Inject LLM proposals at the start of the cycle using the superior seeding method
+            if cfg.get('llm', {}).get('enable', False):
+                try:
+                    r = getattr(state, 'r', None)
+                    if r:
+                        # Drain the entire queue at once for efficiency
+                        proposals_raw = r.lrange('llm:proposals', 0, -1)
+                        if proposals_raw:
+                            r.delete('llm:proposals')
+                            proposals = [json.loads(p) for p in proposals_raw]
+                            injected_count = gen.seed_from_proposals(proposals)
+                            state.set('eil:llm_injection:last_run', {'ts': time.time(), 'injected': injected_count})
+                            if injected_count > 0:
+                                logger.info(f"EIL injected {injected_count} unique proposals from LLM into population.")
+                except Exception as e:
+                    logger.error(f"Failed to inject LLM proposals into EIL: {e}", exc_info=True)
+            
+            if not eligible_symbols or not panel:
+                logger.warning("EIL_PANEL_EMPTY eligible_symbols=%d panel_size=%d" % (len(eligible_symbols), len(panel))); _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1); continue
+            
             # Build cache
             nbars_window = int(_parse_tf_bars(tf_selected, cfg['eil']['fast_window_days']))
             df_cache, feat_samples = _build_panel_cache(panel, tf_selected, nbars_window, base_features, cfg, lake, ff)
@@ -352,248 +276,421 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> None:
                 logger.info("EIL_DF_CACHE_EMPTY panel=%s tf=%s" % (panel, tf_selected))
                 state.set('eil:diag:last_reason', 'no_df_cache_after_feature_build')
                 _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1); continue
-            # Empirical feature stats + gating
-            feature_stats: Dict[str, Dict[str, float]] = {}
-            min_non_nan = float(cfg['discovery'].get('feature_min_non_nan_ratio', 0.30))
-            min_var = float(cfg['discovery'].get('feature_min_variance', 1e-6))
-            active_feature_mask: Dict[str, bool] = {}
-            for f, vals in feat_samples.items():
-                if not vals: continue
-                s = pd.Series(vals, dtype=float)
-                nn_ratio = float(s.notna().mean())
-                try:
-                    var_raw = s.var(ddof=1) if s.shape[0] > 1 else 0.0
-                    var_val = float(var_raw) if isinstance(var_raw, (int,float)) and not pd.isna(var_raw) else 0.0
-                except Exception:
-                    var_val = 0.0
-                keep = (nn_ratio >= min_non_nan) and (var_val >= min_var)
-                active_feature_mask[f] = keep
-                if keep:
-                    feature_stats[f] = {
-                        'q_low': float(s.quantile(0.10)),
-                        'q_high': float(s.quantile(0.90)),
-                        'min': float(s.min()),
-                        'max': float(s.max())
-                    }
+            
+            # Gate features, apply hygiene, and update generator state for the cycle
+            feature_stats, active_feature_mask = _gate_and_stat_features(
+                feat_samples=feat_samples,
+                base_features=base_features,
+                cfg=cfg
+            )
             state.set('eil:feature_gate_diag', {f: {'keep': active_feature_mask.get(f, False)} for f in base_features})
             state.set('eil:feature_stats', {f: {**feature_stats.get(f, {}), 'keep': active_feature_mask.get(f, False)} for f in base_features})
-            gen.features = [f for f in gen.features if active_feature_mask.get(f, False)] or gen.features
-            # Continuity & hygiene
-            suppressed = {f for f,k in active_feature_mask.items() if not k}
-            cont_key_active = 'eil:feat:active_ct'; cont_key_cycles = 'eil:feat:cycles_ct'
-            cont_active = state.get(cont_key_active) or {}; cont_cycles = state.get(cont_key_cycles) or {}
-            for f in base_features:
-                cont_cycles[f] = int(cont_cycles.get(f,0)) + 1
-                if active_feature_mask.get(f, False): cont_active[f] = int(cont_active.get(f,0)) + 1
-            state.set(cont_key_active, cont_active); state.set(cont_key_cycles, cont_cycles)
-            continuity_threshold = float(cfg['discovery'].get('adaptive', {}).get('continuity_threshold', 0.80))
-            patience_c = int(cfg['discovery'].get('adaptive', {}).get('continuity_suppression_patience', 5))
-            continuity_suppress = set()
-            continuity_ratios = {}
-            for f in base_features:
-                a = cont_active.get(f,0); c = cont_cycles.get(f,0); ratio = a/c if c>0 else 0.0
-                continuity_ratios[f] = ratio
-                if c >= patience_c and ratio < continuity_threshold: continuity_suppress.add(f)
-            if continuity_suppress: state.set('eil:continuity_suppress', list(continuity_suppress))
-            suppressed |= continuity_suppress
-            if suppressed:
-                affected_idx = []
-                for i, form in enumerate(gen.population):
-                    if set(_extract_features(form)) & suppressed: affected_idx.append(i)
-                if affected_idx:
-                    reseed_fraction = float(cfg['discovery'].get('reseed_fraction', 0.30))
-                    n_reseed = max(1, int(len(affected_idx) * reseed_fraction))
-                    for idx in affected_idx[:n_reseed]:
-                        gen.population[idx] = gen._create_random_formula()
-                    state.set('eil:population_hygiene', {'suppressed': list(suppressed), 'continuity_suppress': list(continuity_suppress), 'affected': len(affected_idx), 'reseeded': n_reseed})
-            state.set('eil:feature_continuity', continuity_ratios)
+            
+            _apply_feature_hygiene(active_feature_mask, base_features, gen, state, cfg)
+
+            # Pass the computed stats and active features to the generator for this cycle
+            gen.set_feature_stats(feature_stats)
+            active_features = [f for f, is_active in active_feature_mask.items() if is_active]
+            
+            if not active_features:
+                logger.warning("EIL_NO_ACTIVE_FEATURES - all features were filtered out. Check data quality or gating thresholds.")
+                generator_features = base_features
+            else:
+                generator_features = active_features
+
+            gen.set_features(generator_features)
+
             if not gen.population:
                 gen.initialize_population(); logger.info(f"EIL_POP_INIT size={len(gen.population)}")
-            # Gate parameters & overrides
-            cv_folds = int(cfg['discovery']['cv_folds'])
-            cv_embargo = int(cfg['discovery']['cv_embargo_bars'])
-            dsr_cfg = cfg.get('validation', {}).get('dsr', {})
-            bootstrap_cfg = cfg.get('validation', {}).get('bootstrap', {})
-            dsr_enabled = bool(dsr_cfg.get('enabled', True))
-            dsr_bench = float(dsr_cfg.get('benchmark_sr', 0.0))
-            generations_per_cycle = int(cfg['discovery'].get('generations_per_cycle', 1))
-            survivor_top_k = int(cfg['eil']['survivor_top_k'])
-            promotion_criteria = cfg['discovery'].get('promotion_criteria', {})
-            base_min_trades = int(promotion_criteria.get('min_trades', 50))
-            fdr_alpha, dsr_min_prob, min_trades_gate = _apply_stage_overrides(state, cfg, current_stage, gate_stages_cfg)
-            global max_promotions_cycle, max_promotions_day
-            max_promotions_cycle = int(cfg['discovery'].get('max_promotions_per_cycle', 0))
-            max_promotions_day = int(cfg['discovery'].get('max_promotions_per_day', 0))
-            cycle_promoted = 0
-            # GENERATIONS
-            for gidx in range(generations_per_cycle):
-                logger.info(f"EIL_GEN_START cycle={cycle_idx} gen={gidx} pop={len(gen.population)} stage={current_stage}")
-                fitness_scores: Dict[str, float] = {}
-                formula_stats: Dict[str, Dict[str, float]] = {}
-                formula_map: Dict[str, Any] = {}
-                pvals: List[float] = []; fids: List[str] = []
-                zero_trade_formulas = 0
-                for f in gen.population:
-                    fid = hashlib.sha256(json.dumps(f, separators=(',',':')).encode()).hexdigest()
-                    panel_returns: Dict[str, pd.Series] = {}
-                    per_symbol_avg: Dict[str, float] = {}
-                    trade_counts: List[int] = []; sharpe_vals: List[float] = []; all_returns: List[float] = []
-                    for canon, dff in df_cache.items():
-                        stats_bt = sim.run_backtest(dff, f).get('all', {})
-                        if stats_bt and stats_bt.get('n_trades',0) > 0:
-                            trade_counts.append(int(stats_bt.get('n_trades',0)))
-                            sharpe_vals.append(float(stats_bt.get('sharpe',0.0)))
-                            r_list = stats_bt.get('returns', [])
-                            if r_list:
-                                ser = pd.Series(r_list, dtype=float)
-                                panel_returns[canon] = ser
-                                per_symbol_avg.setdefault(canon, 0.0)
-                                per_symbol_avg[canon] = float(ser.mean())
-                                all_returns.extend(ser.tolist())
-                    if not panel_returns:
-                        zero_trade_formulas += 1; continue
-                    cv_res = panel_cv_stats(panel_returns, k_folds=cv_folds, embargo=cv_embargo, alpha_fdr=fdr_alpha, cv_method=cfg['discovery'].get('cv_method','kfold'), bootstrap=bootstrap_cfg)
-                    p_val = float(cv_res.get('p_value', 1.0)); mean_oos = float(cv_res.get('mean_oos',0.0))
-                    dsr_prob = 0.0; agg_sortino=0.0; agg_sharpe=0.0; agg_mdd=0.0
-                    total_trades = sum(trade_counts)
-                    if all_returns:
-                        ser_all = pd.Series(all_returns, dtype=float)
-                        down_std = ser_all[ser_all<0].std(ddof=1)
-                        agg_sortino = float(ser_all.mean()/down_std) if down_std and down_std>0 else 0.0
-                        std_all = ser_all.std(ddof=1)
-                        agg_sharpe = float(ser_all.mean()/std_all) if std_all and std_all>0 else 0.0
-                        eq = (1+ser_all).cumprod(); agg_mdd = float(((eq-eq.cummax())/eq.cummax()).min()) if not eq.empty else 0.0
-                        if dsr_enabled:
-                            dsr_prob = deflated_sharpe_ratio(ser_all, n_trials=len(gen.population), sr_benchmark=dsr_bench)
-                        else:
-                            dsr_prob = 1.0
-                    # Fitness components
-                    act_scale = float(cfg['discovery'].get('activation_trade_scale', 20.0))
-                    activation_gain = 1.0 - math.exp(- total_trades / max(1.0, act_scale)) if total_trades>0 else 0.0
-                    penalty_scale = float(cfg['discovery'].get('fitness_drawdown_penalty_scale', 0.40))
-                    dd_pen = max(0.0, 1.0 + agg_mdd * penalty_scale) if agg_mdd < 0 else 1.0
-                    freq = 0.0
-                    try:
-                        gene_usage = state.get('gene:usage') or {}
-                        used_feats = _extract_features(f)
-                        if used_feats:
-                            freq = sum(gene_usage.get(feat,0) for feat in used_feats)/max(1,len(used_feats))
-                    except Exception:
-                        pass
-                    conc_pen_scale = float(cfg['discovery'].get('fitness_concentration_penalty_scale', 0.25))
-                    conc_pen = 1.0/(1.0+conc_pen_scale*freq) if freq>0 else 1.0
-                    ret_var = 0.0
-                    if all_returns:
-                        ser_all = pd.Series(all_returns, dtype=float)
-                        rv = ser_all.var(ddof=1) if ser_all.shape[0]>1 else 0.0
-                        ret_var = float(rv) if isinstance(rv,(int,float)) and not pd.isna(rv) else 0.0
-                    var_pen_scale = float(cfg['discovery'].get('fitness_variance_penalty_scale', 0.15))
-                    var_pen = 1.0/(1.0+var_pen_scale*ret_var) if ret_var>0 else 1.0
-                    profit_signal = max(0.0, agg_sortino)
-                    trade_signal = np.log1p(total_trades)
-                    fw = cfg['discovery'].get('fitness_weights', {'profit_signal':0.7,'trade_signal':0.3})
-                    fitness = (fw.get('profit_signal',0.7)*profit_signal + fw.get('trade_signal',0.3)*trade_signal)
-                    fitness *= dd_pen * conc_pen * var_pen
-                    fid = hashlib.sha256(json.dumps(f, separators=(',',':')).encode()).hexdigest()
-                    fitness_scores[fid] = fitness
-                    formula_stats[fid] = { 'p_value': p_val, 'mean_oos': mean_oos, 'dsr_prob': dsr_prob, 'trades': float(total_trades), 'fitness': fitness, 'sortino': agg_sortino, 'sharpe': agg_sharpe, 'mdd': agg_mdd }
-                    formula_map[fid] = f  # retain original formula structure for later robustness probing
-                    pvals.append(p_val); fids.append(fid)
-                    # store per-symbol avg for PBO calc batch-level
-                    per_symbol_perf = state.get('eil:tmp:per_symbol_perf') or {}
-                    per_symbol_perf[fid] = per_symbol_avg
-                    state.set('eil:tmp:per_symbol_perf', per_symbol_perf)
-                # Post evaluation
-                state.set('eil:rej:counts', state.get('eil:rej:counts') or {})
-                # Degeneracy detection
-                deg_pct = (zero_trade_formulas / max(1,len(gen.population)))
-                degen_threshold = min(0.85, 0.50 + 0.02 * (gen.population_size / max(1,len(base_features))))
-                state.set('eil:degenerate_pct', round(deg_pct,4))
-                if deg_pct >= degen_threshold:
-                    logger.warning(f"EIL_DEGENERATE pct={deg_pct:.2f} >= {degen_threshold:.2f} reseeding")
-                    gen.initialize_population(); continue
-                # FDR
-                accepts = []
-                if pvals:
-                    flags, fdr_thresh = benjamini_hochberg(pvals, fdr_alpha)
-                    accepts = [fid for fid, flag in zip(fids, flags) if flag]
-                    for fid, flag in zip(fids, flags):
-                        if not flag: _record_rejection(state, f'pval_stage_{current_stage}', fid)
-                # Secondary gates (DSR, trades)
-                final_accepts = []
-                for fid in accepts:
-                    st = formula_stats.get(fid, {})
-                    if dsr_enabled and st.get('dsr_prob',0.0) < dsr_min_prob:
-                        _record_rejection(state, f'dsr_stage_{current_stage}', fid); continue
-                    if st.get('trades',0.0) < min_trades_gate:
-                        _record_rejection(state, f'trades_stage_{current_stage}', fid); continue
-                    # Robustness probe (only once trades gate passed)
-                    if prober_enabled:
-                        sym0 = next(iter(df_cache.keys()))
-                        probe_df = df_cache[sym0]
-                        formula_obj = formula_map.get(fid)
-                        if formula_obj:
-                            probe_res = feature_prober.score(probe_df, formula_obj)
-                            robust_score = probe_res.get('robust_score',0.0)
-                            min_robust = float(prober_cfg.get('min_robust_score',0.55))
-                            if robust_score < min_robust:
-                                _record_rejection(state, f'robust_stage_{current_stage}', fid); continue
-                    final_accepts.append(fid)
-                accepts = final_accepts
-                survivor_density = (len(accepts)/len(gen.population)) if gen.population else 0.0
-                median_trades = float(pd.Series([formula_stats[f]['trades'] for f in accepts]).median()) if accepts else 0.0
-                state.set('eil:gate:diagnostic', {'stage': current_stage, 'survivor_density': survivor_density, 'median_trades': median_trades})
-                # Promotion selection (top fitness among accepts)
-                if accepts:
-                    ranked = sorted(accepts, key=lambda fid: formula_stats[fid]['fitness'], reverse=True)[:survivor_top_k]
-                    survivors = {fid: {'fid': fid, 'formula': None, 'score': formula_stats[fid]['fitness']} for fid in ranked}
-                    _promote_survivors(survivors, panel)
-                # Evolve population
-                gen.run_evolution_cycle(fitness_scores=fitness_scores)
-                # Compute PBO once per generation when enough symbols & formulas
                 try:
-                    per_symbol_perf = state.get('eil:tmp:per_symbol_perf') or {}
-                    num_splits = int(cfg['discovery'].get('pbo_splits', 25))
-                    min_symbols = int(cfg['discovery'].get('pbo_min_symbols', 4))
-                    pbo_seed = int(cfg['system'].get('seed', 1337) + cycle_idx*100 + gidx)
-                    pbo_val = 0.0
-                    if per_symbol_perf and len(per_symbol_perf) >= 3:
-                        pbo_val = compute_pbo(per_symbol_perf, num_splits=num_splits, min_symbols=min_symbols, seed=pbo_seed)
-                    state.set('eil:pbo:last', {'cycle': cycle_idx, 'gen': gidx, 'pbo': pbo_val, 'formulas': len(per_symbol_perf)})
-                except Exception as _pbo_err:
-                    logger.debug(f"EIL_PBO_ERROR {type(_pbo_err).__name__}:{_pbo_err}")
-                finally:
-                    state.set('eil:tmp:per_symbol_perf', {})
-            # Escalate stage after generations
-            current_stage, stage_history = _maybe_escalate_stage(state, cycle_idx, current_stage, gate_stages_cfg, stage_escalation_cfg, stage_history)
-            # Stagnation detection: if median p-value improvement absent N cycles, bump mutation rates
-            stagn_cfg = cfg['discovery'].get('stagnation', {})
-            if stagn_cfg.get('enabled', True):
-                window = int(stagn_cfg.get('window', 8))
-                min_delta = float(stagn_cfg.get('min_pval_delta', 0.02))
-                hist = state.get('eil:pval:median_hist') or []
-                last_med_diag = state.get('eil:diag:last_pval_stats') or {}
-                last_med = last_med_diag.get('median')
-                if last_med is not None:
-                    hist.append(float(last_med))
-                    if len(hist) > window: hist = hist[-window:]
-                    state.set('eil:pval:median_hist', hist)
-                    if len(hist) == window:
-                        if (hist[0] - hist[-1]) < min_delta:
-                            # bump mutation rates temporarily
-                            bump = float(stagn_cfg.get('mutation_bump', 0.15))
-                            gen.mutation_threshold_rate = min(0.95, gen.mutation_threshold_rate + bump)
-                            gen.mutation_feature_rate = min(0.95, gen.mutation_feature_rate + bump/2)
-                            state.set('eil:stagnation:event', {'cycle': cycle_idx, 'new_mut_threshold': gen.mutation_threshold_rate})
-            _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1)
-        except KeyboardInterrupt:
-            logger.info('EIL_INTERRUPTED'); break
-        except Exception as e:
-            logger.opt(exception=True).error(f"EIL loop error: {e}"); _sleep(1); state.set('eil:cycle_idx', cycle_idx + 1)
+                    with open("initial_population.json", "w") as f:
+                        json.dump(gen.population, f, indent=2)
+                    logger.info("Dumped initial population to initial_population.json")
+                except Exception as e:
+                    logger.error(f"Failed to dump initial population: {e}")
 
-@cli.command('run')
-def run_cmd():  # Click CLI entrypoint delegates
-    run_eil()
+            # Gate parameters & overrides
+            fdr_alpha, dsr_min_prob, min_trades_gate = _apply_stage_overrides(state, cfg, current_stage, gate_stages_cfg)
+            validator.fdr_alpha = fdr_alpha
+            validator.dsr_min_prob = dsr_min_prob
+            validator.min_trades_gate = min_trades_gate
+
+            generations_per_cycle = int(cfg['discovery'].get('generations_per_cycle', 1))
+            
+            # --- Run Generations ---
+            cycle_survivors = _run_generations(
+                generations_per_cycle=generations_per_cycle,
+                cycle_idx=cycle_idx,
+                current_stage=current_stage,
+                gen=gen,
+                sim=sim,
+                df_cache=df_cache,
+                validator=validator,
+                feature_prober=feature_prober,
+                state=state,
+                base_features=base_features,
+                panel_universe=panel,
+                timeframe=tf_selected,
+                cfg=cfg
+            )
+
+            # Process the collected survivors from all generations in the cycle
+            if cycle_survivors:
+                # Deduplicate survivors based on formula hash (alpha_id)
+                unique_survivors_map = {s['alpha_id']: s for s in cycle_survivors}
+                unique_survivors = list(unique_survivors_map.values())
+                logger.success(f"EIL_CYCLE_SURVIVORS_FOUND total_unique={len(unique_survivors)} from cycle={cycle_idx}")
+                for s in unique_survivors:
+                    logger.info(f"SURVIVOR alpha_id={s.get('alpha_id','n/a')[:8]} sharpe={s.get('sharpe',-1):.2f} pval={s.get('p_value',-1):.3f} dsr={s.get('dsr_prob',-1):.2f} robust={s.get('robust_score',-1):.2f} trades={s.get('n_trades',-1)} formula={json.dumps(s.get('formula'))}")
+
+                # Persist top-K survivors from the cycle for promotion
+                survivor_top_k = int(cfg['eil']['survivor_top_k'])
+                sorted_survivors = sorted(list(unique_survivors), key=lambda x: x.get('sharpe', 0.0), reverse=True)
+                top_k_survivors = sorted_survivors[:survivor_top_k]
+                
+                all_survivors_from_cycle.extend(top_k_survivors)
+
+                # Update state with diagnostics and candidates
+                state.set('eil:survivors:last_cycle', top_k_survivors)
+                for survivor in top_k_survivors:
+                    alpha_id = survivor['alpha_id']
+                    candidate_payload = {
+                        'score': survivor.get('sharpe', 0.0),
+                        'p_value': survivor.get('p_value'),
+                        'dsr_prob': survivor.get('dsr_prob'),
+                        'trades': survivor.get('n_trades'),
+                        'formula': survivor.get('formula'),
+                    }
+                    state.set(f'eil:candidates:{alpha_id}', candidate_payload, ttl=48*3600) # 48h TTL
+            else:
+                logger.info(f"No survivors found in cycle {cycle_idx}.")
+
+
+            # Stage escalation logic
+            current_stage, stage_history = _maybe_escalate_stage(state, cycle_idx, current_stage, gate_stages_cfg, stage_escalation_cfg, stage_history)
+
+            # Persist population for warm start
+            state.set('eil:population_struct', gen.population)
+            state.set('eil:cycle_idx', cycle_idx + 1)
+            _sleep(1)
+
+        except Exception as e:
+            logger.error(f"EIL_CYCLE_FAIL idx={state.get('eil:cycle_idx') or 0} err={e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            state.set('eil:cycle_idx', (state.get('eil:cycle_idx') or 0) + 1)
+            _sleep(5)
+            continue
+    
+    return all_survivors_from_cycle
+
+def _build_panel_cache(panel: List[str], tf_selected: str, nbars_window: int, base_features: List[str], cfg: dict, lake: Lakehouse, ff: FeatureFactory) -> Tuple[Dict[str, pd.DataFrame], Dict[str, list]]:
+    """Build panel dataframe cache & empirical feature stats (quantiles) once per cycle."""
+    logger.info("--- Building EIL Panel Cache & Data Quality Analysis ---")
+    
+    all_symbol_dfs = []
+    for canon in panel:
+        raw_df = lake.get_data(canon, tf_selected).tail(nbars_window)
+        if raw_df.empty:
+            continue
+        raw_df['item'] = canon
+        all_symbol_dfs.append(raw_df)
+
+    if not all_symbol_dfs:
+        return {}, {}
+        
+    panel_df = pd.concat(all_symbol_dfs).reset_index().set_index(['item', 'timestamp'])
+    
+    # The feature factory expects a multi-index dataframe and will handle per-item calculations.
+    dff = ff.create(panel_df, feature_configs=cfg.get('features', {}))
+
+    if dff.empty:
+        logger.warning(f"[DATA_QUALITY] DataFrame for panel is empty AFTER feature creation.")
+        return {}, {}
+
+    logger.info(f"dff columns: {dff.columns.tolist()}")
+
+    # The feature factory now returns a single dataframe with a multi-index.
+    # We can group by item to get the individual dataframes for the cache.
+    df_cache = {str(item): group for item, group in dff.groupby(level='item')}
+
+    feat_samples: Dict[str, list] = {f: [] for f in base_features}
+    for f in base_features:
+        if f in dff.columns:
+            col = dff[f].dropna()
+            if not col.empty:
+                step = max(1, len(col) // 50)
+                feat_samples[f].extend(col.iloc[::step].tolist())
+                
+    return df_cache, feat_samples
+
+def _gate_and_stat_features(feat_samples: Dict[str, list], base_features: List[str], cfg: dict) -> Tuple[Dict[str, Dict[str, float]], Dict[str, bool]]:
+    """Calculate empirical feature stats and create an active feature mask based on quality gates."""
+    feature_stats: Dict[str, Dict[str, float]] = {}
+    min_non_nan = float(cfg['discovery'].get('feature_min_non_nan_ratio', 0.30))
+    min_var = float(cfg['discovery'].get('feature_min_variance', 1e-6))
+    active_feature_mask: Dict[str, bool] = {}
+    
+    logger.info("--- EIL Feature Gate Diagnostics ---")
+    
+    for f in base_features:
+        vals = feat_samples.get(f)
+        if not vals:
+            active_feature_mask[f] = False
+            logger.info(f"  - Feature: {f:<20} | Active: False | Reason: No values sampled.")
+            continue
+        
+        s = pd.to_numeric(pd.Series(vals), errors='coerce').dropna()
+        if s.empty:
+            active_feature_mask[f] = False
+            logger.info(f"  - Feature: {f:<20} | Active: False | Reason: No numeric values after coercion.")
+            continue
+        
+        nn_ratio = float(s.notna().mean())
+        
+        try:
+            var_raw = s.var(ddof=1) if s.notna().sum() > 1 else 0.0
+            if isinstance(var_raw, complex):
+                var_val = var_raw.real if pd.notna(var_raw.real) else 0.0
+            elif isinstance(var_raw, (int, float)):
+                var_val = float(var_raw) if pd.notna(var_raw) else 0.0
+            else:
+                var_val = 0.0
+        except Exception as e:
+            var_val = 0.0
+            logger.warning(f"Could not calculate variance for {f}: {e}")
+
+        keep = (nn_ratio >= min_non_nan) and (var_val >= min_var)
+        active_feature_mask[f] = keep
+        
+        logger.info(f"  - Feature: {f:<20} | Active: {str(keep):<5} | Non-NaN: {nn_ratio:8.2%} (min: {min_non_nan:.2%}) | Variance: {var_val:12.6f} (min: {min_var:.6f})")
+
+        if keep:
+            feature_stats[f] = {
+                'min': float(s.min()),
+                'q10': float(s.quantile(0.10)),
+                'q25': float(s.quantile(0.25)),
+                'median': float(s.median()),
+                'q75': float(s.quantile(0.75)),
+                'q90': float(s.quantile(0.90)),
+                'max': float(s.max())
+            }
+    return feature_stats, active_feature_mask
+
+def _apply_feature_hygiene(active_feature_mask: Dict[str, bool], base_features: List[str], gen: GeneticGenerator, state: StateManager, cfg: dict) -> set:
+    """Apply continuity-based suppression and reseed population if needed."""
+    suppressed = {f for f, k in active_feature_mask.items() if not k}
+    cont_key_active = 'eil:feat:active_ct'
+    cont_key_cycles = 'eil:feat:cycles_ct'
+    cont_active = state.get(cont_key_active) or {}
+    cont_cycles = state.get(cont_key_cycles) or {}
+    for f in base_features:
+        cont_cycles[f] = int(cont_cycles.get(f, 0)) + 1
+        if active_feature_mask.get(f, False):
+            cont_active[f] = int(cont_active.get(f, 0)) + 1
+    state.set(cont_key_active, cont_active)
+    state.set(cont_key_cycles, cont_cycles)
+    
+    continuity_threshold = float(cfg['discovery'].get('adaptive', {}).get('continuity_threshold', 0.80))
+    patience_c = int(cfg['discovery'].get('adaptive', {}).get('continuity_suppression_patience', 5))
+    continuity_suppress = set()
+    continuity_ratios = {}
+    for f in base_features:
+        a = cont_active.get(f,0); c = cont_cycles.get(f,0); ratio = a/c if c>0 else 0.0
+        continuity_ratios[f] = ratio
+        if c >= patience_c and ratio < continuity_threshold:
+            continuity_suppress.add(f)
+            
+    if continuity_suppress:
+        state.set('eil:continuity_suppress', list(continuity_suppress))
+        
+    suppressed |= continuity_suppress
+    
+    if suppressed:
+        affected_idx = []
+        for i, form in enumerate(gen.population):
+            if set(_extract_features(form)) & suppressed:
+                affected_idx.append(i)
+        if affected_idx:
+            reseed_fraction = float(cfg['discovery'].get('reseed_fraction', 0.30))
+            n_reseed = max(1, int(len(affected_idx) * reseed_fraction))
+            for idx in affected_idx[:n_reseed]:
+                gen.population[idx] = gen._create_random_formula()
+            state.set('eil:population_hygiene', {'suppressed': list(suppressed), 'continuity_suppress': list(continuity_suppress), 'affected': len(affected_idx), 'reseeded': n_reseed})
+            
+    state.set('eil:feature_continuity', continuity_ratios)
+    return suppressed
+
+def _run_generations(
+    generations_per_cycle: int,
+    cycle_idx: int,
+    current_stage: str,
+    gen: GeneticGenerator,
+    sim: SimLab,
+    df_cache: Dict[str, pd.DataFrame],
+    validator: Validator,
+    feature_prober: Optional[FeatureProber],
+    state: StateManager,
+    base_features: List[str],
+    panel_universe: List[str],
+    timeframe: str,
+    cfg: dict
+) -> List[Dict[str, Any]]:
+    """Run the evolutionary algorithm for a set number of generations.
+
+    Added diagnostics:
+      - Per generation histogram + percentiles of sharpe & trades.
+      - Logs top-K and bottom-K formulas by sharpe with fid + size.
+      - Rejection attribution (min_trades vs p_value vs dsr) stored in Redis.
+    """
+    
+    cycle_survivors = []
+    # REMOVED: inspect hack to get feature_prober from outer scope
+
+    for gidx in range(generations_per_cycle):
+        logger.info(f"EIL_GEN_START cycle={cycle_idx} gen={gidx} pop={len(gen.population)} stage={current_stage}")
+        
+        evaluated_formulas = []
+        zero_trade_formulas = 0
+        per_formula_meta = {}
+
+        for f in gen.population:
+            fid = hashlib.sha256(json.dumps(f, separators=(',',':')).encode()).hexdigest()
+            
+            all_trades = []
+            # The new simlab takes the full panel, not per-item dfs
+            fees_pct = cfg['execution']['paper_fees_bps'] / 10000.0
+            slippage_pct = cfg['execution']['paper_slippage_bps'] / 10000.0
+            sim_result = sim.run_backtest(pd.concat(df_cache.values()), f, fee_pct=fees_pct, slippage_pct=slippage_pct)
+            
+            if sim_result is not None and not sim_result.empty:
+                all_trades.append(sim_result)
+            
+            if not all_trades:
+                zero_trade_formulas += 1
+                evaluated_formulas.append({'alpha_id': fid, 'formula': f, 'trades': pd.DataFrame(), 'sharpe': -1.0})
+                continue
+
+            panel_trades_df = pd.concat(all_trades).sort_index()
+
+            if not panel_trades_df.empty:
+                sharpe = panel_trades_df['pnl'].mean() / panel_trades_df['pnl'].std() if panel_trades_df['pnl'].std() != 0 else 0
+                meta = {'fid': fid, 'trades': len(panel_trades_df), 'sharpe': sharpe}
+                per_formula_meta[fid] = meta
+                evaluated_formulas.append({
+                    'alpha_id': fid,
+                    'formula': f,
+                    'trades': panel_trades_df,
+                    'sharpe': sharpe,
+                })
+            else:
+                per_formula_meta[fid] = {'fid': fid, 'trades': 0, 'sharpe': -1.0}
+                evaluated_formulas.append({'alpha_id': fid, 'formula': f, 'trades': pd.DataFrame(), 'sharpe': -1.0})
+
+        # After evaluation, compute diagnostics
+        if per_formula_meta:
+            import numpy as _np
+            trades_arr = _np.array([m['trades'] for m in per_formula_meta.values()])
+            sharpe_arr = _np.array([m['sharpe'] for m in per_formula_meta.values()])
+            def _pct(a,p):
+                return float(_np.percentile(a, p)) if a.size else 0.0
+            diag = {
+                'cycle': cycle_idx,
+                'gen': gidx,
+                'pop': len(gen.population),
+                'zero_trade_pct': round((zero_trade_formulas / max(1,len(gen.population))),4),
+                'trades_median': _pct(trades_arr,50),
+                'trades_p90': _pct(trades_arr,90),
+                'sharpe_median': _pct(sharpe_arr,50),
+                'sharpe_p90': _pct(sharpe_arr,90),
+            }
+            state.set(f'eil:diag:gen:{cycle_idx}:{gidx}', diag, ttl=24*3600)
+            if sharpe_arr.size:
+                # log concise line
+                logger.info(f"EIL_GEN_DIAG cycle={cycle_idx} gen={gidx} pop={len(gen.population)} zero_trade_pct={diag['zero_trade_pct']:.2f} trades_med={diag['trades_median']} sharpe_med={diag['sharpe_median']:.2f} sharpe_p90={diag['sharpe_p90']:.2f}")
+            # top/bottom sample
+            sorted_by_sharpe = sorted(per_formula_meta.values(), key=lambda m: m['sharpe'])
+            sample_k = min(3, len(sorted_by_sharpe))
+            top_sample = sorted_by_sharpe[-sample_k:]
+            bot_sample = sorted_by_sharpe[:sample_k]
+            state.set(f'eil:diag:gen_top:{cycle_idx}:{gidx}', top_sample, ttl=24*3600)
+            state.set(f'eil:diag:gen_bot:{cycle_idx}:{gidx}', bot_sample, ttl=24*3600)
+
+        # Degeneracy detection
+        deg_pct = (zero_trade_formulas / max(1, len(gen.population)))
+        degen_threshold = min(0.85, 0.50 + 0.02 * (gen.population_size / max(1, len(base_features))))
+        state.set('eil:degenerate_pct', round(deg_pct, 4))
+        if deg_pct >= degen_threshold:
+            logger.warning(f"EIL_DEGENERATE pct={deg_pct:.2f} >= {degen_threshold:.2f} reseeding")
+            gen.initialize_population()
+            continue
+
+        # Validate the entire batch of evaluated formulas
+        validated_survivors, rejections = validator.validate_batch(evaluated_formulas)
+
+        # --- Rejection Attribution (Validation) ---
+        total_rejected = 0
+        rejection_summary = {}
+        for reason, fids in rejections.items():
+            if fids:
+                # Use a more specific reason that includes the stage
+                staged_reason = f"{reason}_stage_{current_stage}"
+                for fid in fids:
+                    _record_rejection(state, staged_reason, fid)
+                total_rejected += len(fids)
+                rejection_summary[reason] = len(fids)
+        
+        if total_rejected > 0:
+            logger.info(f"EIL_GATE_REJECT stage=validation rejected={total_rejected} passed={len(validated_survivors)} breakdown={rejection_summary}")
+
+        # Robustness filtering
+        robust_survivors = []
+        if feature_prober:
+            robust_min = float(cfg.get('prober', {}).get('min_robust_score', 0.55))
+            for survivor in validated_survivors:
+                # Use the first symbol's df for robustness probe
+                df_features = list(df_cache.values())[0] if df_cache else None
+                if df_features is not None:
+                    probe_res = feature_prober.score(df_features, survivor['formula'])
+                    if probe_res.get('robust_score', 0.0) >= robust_min:
+                        survivor['robust_score'] = probe_res['robust_score']
+                        robust_survivors.append(survivor)
+                    else:
+                        # --- Rejection Attribution (Robustness) ---
+                        reason = f"robust_stage_{current_stage}"
+                        _record_rejection(state, reason, survivor['alpha_id'])
+                else:
+                    # If no data for probing, pass survivor through
+                    robust_survivors.append(survivor)
+            
+            rejected_robust_fids_count = len(validated_survivors) - len(robust_survivors)
+            if rejected_robust_fids_count > 0:
+                logger.info(f"EIL_GATE_REJECT stage=robustness rejected={rejected_robust_fids_count} passed={len(robust_survivors)}")
+        else:
+            robust_survivors = validated_survivors # Skip if prober disabled
+        
+        generation_survivors = robust_survivors
+        
+        # Add universe and timeframe to each survivor of the generation
+        for s in generation_survivors:
+            s['universe'] = panel_universe
+            s['timeframe'] = timeframe
+
+        # Add survivors to the cycle list
+        cycle_survivors.extend(generation_survivors)
+
+        # Evolve population based on survivors
+        fitness_scores = {item['alpha_id']: item.get('sharpe', -1.0) for item in evaluated_formulas}
+        gen.run_evolution_cycle(fitness_scores=fitness_scores)
+
+    return cycle_survivors
+
+@cli.command(name="main")
+@click.option("--config", default="configs/config.yaml", help="Path to config.yaml")
+def main_command(config):
+    """Main entrypoint for the EIL service."""
+    cfg = load_config(config)
+    run_eil(cfg)
 
 if __name__ == "__main__":
     cli()

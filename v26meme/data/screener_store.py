@@ -20,7 +20,7 @@ class ScreenerStore:
         if self.state:
             self.state.set("data:screener:latest", payload)
             # also publish just the set of canonicals
-            canons = list({i["display"] for i in instrument_list})
+            canons = list({i["canonical"] for i in instrument_list})
             self.state.set("data:screener:latest:canonicals", canons)
         return ts, str(fp)
 

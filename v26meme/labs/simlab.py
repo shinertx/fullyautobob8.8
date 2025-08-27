@@ -1,115 +1,200 @@
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Tuple, Any
+"""
+A simulation lab for backtesting trading strategies.
+This is the core backtesting engine, designed to be fast and robust for research purposes.
+"""
+import logging
+from typing import Dict, Union
 
-def _evaluate_formula(row, formula):
-    if not isinstance(formula[0], list):
-        feature, op, value = formula
-        try:
-            if op == '>': return row[feature] > value
-            if op == '<': return row[feature] < value
-        except KeyError:
-            return False
-    left, logical_op, right = formula
-    if logical_op == 'AND':
-        return _evaluate_formula(row, left) and _evaluate_formula(row, right)
-    else:
-        return _evaluate_formula(row, left) or _evaluate_formula(row, right)
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
 
 class SimLab:
-    def __init__(self, fees_bps, slippage_bps, slippage_table=None, max_holding_bars: int | None = None):
-        self.fee = fees_bps/10000.0
-        self.slippage = slippage_bps/10000.0
-        self.slip_table = slippage_table or {}
-        self.max_holding_bars = max_holding_bars
+    """
+    A simulation lab for backtesting trading strategies.
+    """
 
-    def _stats(self, returns: pd.Series) -> dict:
-        if returns.empty: return {"n_trades": 0}
-        equity = (1+returns).cumprod()
-        dd = (equity - equity.cummax()) / equity.cummax()
-        down_std = returns[returns < 0].std()
-        return {
-            "n_trades": int(returns.shape[0]),
-            "win_rate": float((returns > 0).mean()),
-            "avg_return": float(returns.mean()),
-            "sortino": float(returns.mean()/down_std) if (down_std is not None and down_std>0) else 0.0,
-            "sharpe": float(returns.mean()/returns.std()) if (returns.std() is not None and returns.std()>0) else 0.0,
-            "mdd": float(dd.min()),
-            "returns": [float(x) for x in returns.tolist()],
-        }
-
-    def _slip_for(self, display: str) -> float:
-        bps = float(self.slip_table.get(display, 0.0))
-        return max(self.slippage, bps/10000.0)
-
-    def run_backtest(self, df: pd.DataFrame, formula: list, bidirectional: bool = False, time_stop_bars: int | None = None) -> dict:
-        if df.empty or len(df) < 60: return {}
-        df = df.copy()
-        display = df.attrs.get("display", None)
-        slip = self._slip_for(display) if display else self.slippage
-        signals = df.apply(lambda row: _evaluate_formula(row, formula), axis=1)
-        edges = signals.diff().fillna(0)
-        try:
-            edges = edges.astype(int)
-        except Exception:
-            edges = edges.apply(lambda x: 1 if x>0 else (-1 if x<0 else 0))
-        in_trade, entry_price, entry_idx, direction = False, 0.0, 0, 1
-        trades = []
-        hold_lengths: List[int] = []
-        for i in range(len(df)):
-            force_exit = False
-            if in_trade and self.max_holding_bars is not None and (i - entry_idx) >= self.max_holding_bars:
-                force_exit = True
-            if in_trade and time_stop_bars is not None and (i - entry_idx) >= time_stop_bars:
-                force_exit = True
-            # entry conditions
-            if edges.iloc[i] > 0 and not in_trade:
-                in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 + slip), i, 1
-            elif bidirectional and edges.iloc[i] < 0 and not in_trade:
-                in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 - slip), i, -1
-            # exit / flip
-            elif in_trade and ((edges.iloc[i] < 0 and direction == 1) or (edges.iloc[i] > 0 and direction == -1) or force_exit):
-                exit_px_raw = df['close'].iloc[i]
-                if direction == 1:
-                    exit_price = exit_px_raw * (1 - slip)
-                    pnl = ((exit_price - entry_price) / entry_price) - (2 * self.fee)
-                else:  # short
-                    exit_price = exit_px_raw * (1 + slip)
-                    pnl = ((entry_price - exit_price) / entry_price) - (2 * self.fee)
-                trades.append(pnl)
-                hold_lengths.append(i - entry_idx)
-                in_trade = False
-                # optional immediate flip if bidirectional and opposite signal edge present
-                if bidirectional and not force_exit:
-                    if edges.iloc[i] > 0 and direction == -1:
-                        in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 + slip), i, 1
-                    elif edges.iloc[i] < 0 and direction == 1:
-                        in_trade, entry_price, entry_idx, direction = True, df['close'].iloc[i] * (1 - slip), i, -1
-        if in_trade:
-            exit_px_raw = df['close'].iloc[-1]
-            if direction == 1:
-                exit_price = exit_px_raw * (1 - slip)
-                pnl = ((exit_price - entry_price) / entry_price) - (2 * self.fee)
-            else:
-                exit_price = exit_px_raw * (1 + slip)
-                pnl = ((entry_price - exit_price) / entry_price) - (2 * self.fee)
-            trades.append(pnl)
-            hold_lengths.append(len(df) - entry_idx)
-        if not trades: return {"all": {"n_trades": 0}}
-        ser = pd.Series(trades)
-        stats = self._stats(ser)
-        stats['median_hold'] = float(pd.Series(hold_lengths).median()) if hold_lengths else 0.0
-        stats['avg_hold'] = float(pd.Series(hold_lengths).mean()) if hold_lengths else 0.0
-        return {"all": stats}
-
-    def run_panel(self, dfs: Dict[str, pd.DataFrame], formula: list, **kw) -> Dict[str, dict]:
-        """Vectorized-style panel evaluation returning per-symbol stats.
-
-        PIT: Each symbol evaluated independently on closed bars only.
+    def run_backtest(self, panel: pd.DataFrame, formula: list, fee_pct: float, slippage_pct: float) -> pd.DataFrame:
         """
-        out: Dict[str, dict] = {}
-        for sym, dff in dfs.items():
-            res = self.run_backtest(dff, formula, **kw).get('all', {})
-            if res:
-                out[sym] = res
-        return out
+        Run a backtest for a given formula on a panel, which can be single-item or multi-item.
+        """
+        if panel.empty:
+            return pd.DataFrame()
+
+        # --- 1. Evaluate Formula to get Signals ---
+        all_signals = []
+        is_multi_item = 'item' in panel.index.names
+        
+        if is_multi_item:
+            for item, group in panel.groupby(level='item'):
+                if group.empty: continue
+                try:
+                    signals = self._evaluate_formula(group.copy(), formula)
+                    signal_df = pd.DataFrame({'signals': signals}, index=group.index)
+                    all_signals.append(signal_df)
+                except Exception as e:
+                    logger.debug(f"Could not evaluate formula for {item}: {e}")
+                    continue
+        else:
+            try:
+                signals = self._evaluate_formula(panel.copy(), formula)
+                signal_df = pd.DataFrame({'signals': signals}, index=panel.index)
+                all_signals.append(signal_df)
+            except Exception as e:
+                logger.debug(f"Could not evaluate formula for single item: {e}")
+
+        if not all_signals:
+            return pd.DataFrame()
+
+        # --- 2. Generate Trade Edges ---
+        signals_df = pd.concat(all_signals).sort_index()
+        panel = panel.join(signals_df, how='left')
+        panel['signals'] = panel['signals'].fillna(False)
+
+        if is_multi_item:
+            panel['signals'] = panel['signals'].astype(int)
+            panel["edges"] = panel.groupby(level="item")["signals"].diff().fillna(0)
+        else:
+            panel["edges"] = panel["signals"].astype(int).diff().fillna(0)
+
+        # --- 3. Calculate PnL from Edges ---
+        trade_returns = self._calculate_trade_returns(panel, fee_pct, slippage_pct)
+        return trade_returns
+
+    def _evaluate_formula(self, df: pd.DataFrame, formula: list) -> pd.Series:
+        """
+        Recursively evaluate a formula on a single-item DataFrame.
+        Handles nested logic, feature-vs-feature, and feature-vs-literal comparisons.
+        The formula now follows a more natural [LEFT, OPERATOR, RIGHT] structure.
+        """
+        if not isinstance(formula, list) or not formula:
+            # An empty formula is considered a "pass" (no signal)
+            return pd.Series(False, index=df.index)
+
+        # Handle logical operators (recursive)
+        if len(formula) == 3 and formula[1] in ["AND", "OR"]:
+            op = formula[1]
+            left = self._evaluate_formula(df, formula[0])
+            right = self._evaluate_formula(df, formula[2])
+            return left & right if op == "AND" else left | right
+
+        # Handle comparison operators (base case)
+        if len(formula) == 3:
+            left_val, op, right_val = formula
+            
+            # Resolve left and right sides. They can be feature names (str) or literals (int/float).
+            s1 = df[left_val] if isinstance(left_val, str) and left_val in df.columns else left_val
+            s2 = df[right_val] if isinstance(right_val, str) and right_val in df.columns else right_val
+
+            # If a feature is missing, return a Series of False
+            if isinstance(s1, str) or isinstance(s2, str):
+                logger.warning(f"Feature not found in evaluation. Left: '{left_val}', Right: '{right_val}'")
+                return pd.Series(False, index=df.index)
+
+            # Ensure we are comparing series with series or series with scalar
+            if not isinstance(s1, pd.Series) and not isinstance(s2, pd.Series):
+                 return pd.Series(False, index=df.index)
+
+            # The result of a comparison is a boolean Series, which is what we want.
+            if op == "<": return s1 < s2
+            if op == ">": return s1 > s2
+            if op == "<=": return s1 <= s2
+            if op == ">=": return s1 >= s2
+            if op == "==": return s1 == s2
+            if op == "!=": return s1 != s2
+
+        raise ValueError(f"Unsupported formula structure: {formula}")
+
+    def _calculate_trade_returns(self, panel: pd.DataFrame, fee_pct: float, slippage_pct: float) -> pd.DataFrame:
+        """
+        Calculate returns from trade edges.
+        A positive edge (+1.0) is a buy, a negative edge (-1.0) is a sell.
+        This is a critical PIT-correct function. PnL is calculated based on the NEXT bar's open price.
+        """
+        trades = panel[panel["edges"] != 0].copy()
+        if trades.empty:
+            return pd.DataFrame()
+
+        # Get the price for the NEXT bar to calculate PnL (avoids lookahead)
+        is_multi_item = 'item' in panel.index.names
+        if is_multi_item:
+            trades['pnl_price'] = panel.groupby(level='item')['open'].shift(-1)
+        else:
+            trades['pnl_price'] = panel['open'].shift(-1)
+        
+        # Apply slippage and fees to the execution price of the CURRENT bar's close
+        trades["exec_price"] = trades["close"] * (1 + trades["edges"] * slippage_pct)
+        trades["trade_cost"] = trades["exec_price"] * fee_pct
+        
+        # PnL is the difference between the future price and our execution price
+        # For a buy (edge=1), PnL = pnl_price - exec_price
+        # For a sell (edge=-1), PnL = exec_price - pnl_price
+        # This simplifies to: PnL = edge * (pnl_price - exec_price)
+        trades["pnl"] = trades["edges"] * (trades["pnl_price"] - trades["exec_price"]) - trades["trade_cost"]
+        
+        # Drop the last trade for each item if it can't be closed (no next bar to calculate PnL)
+        trades = trades.dropna(subset=['pnl'])
+
+        return trades.loc[:, ["pnl"]]
+
+
+# Example usage (for testing or ad-hoc analysis)
+def run_standalone_backtest(formula: list):
+    """
+    A simple harness to run a backtest with dummy data to verify the logic.
+    """
+    logging.basicConfig(level=logging.INFO)
+    logger.info("--- Running Standalone Backtest ---")
+    
+    # 1. Create a dummy data panel with a clear, predictable signal
+    try:
+        index = pd.MultiIndex.from_product(
+            [pd.to_datetime(pd.date_range('2024-01-01', periods=10, freq='h')), ['BTC_USD_SPOT']],
+            names=['timestamp', 'item']
+        )
+        panel = pd.DataFrame(index=index)
+        # This data is crafted to make the example_formula trigger trades
+        panel['open'] =  [100, 101, 102, 103, 104, 103, 102, 101, 100, 99]
+        panel['close'] = [101, 102, 103, 104, 103, 102, 101, 100, 99, 98]
+        panel['volume'] = 10
+        logger.info(f"Created dummy panel with data:\n{panel}")
+
+    except Exception as e:
+        logger.error(f"Could not create dummy data: {e}")
+        return
+
+    # 2. Run backtest
+    sim = SimLab()
+    
+    # Manually trace the logic to show the intermediate steps
+    logger.info("\n--- Tracing Backtest Logic ---")
+    signals = sim._evaluate_formula(panel, formula)
+    logger.info(f"1. Signals (where is close > 102.5?):\n{signals.astype(int).values}")
+    
+    panel['signals'] = signals
+    panel["edges"] = panel.groupby(level="item")["signals"].astype(int).diff().fillna(0)
+    logger.info(f"2. Edges (where does signal change?):\n{panel['edges'].values}")
+    
+    trade_returns = sim._calculate_trade_returns(panel, 0.001, 0.0005)
+    logger.info("--- End Trace ---")
+
+    # 3. Report results
+    if not trade_returns.empty:
+        logger.info(f"\nBacktest complete. SUCCESS. Generated {len(trade_returns)} trades.")
+        logger.info(f"Trade returns:\n{trade_returns}")
+        pnl = trade_returns['pnl']
+        sharpe = pnl.mean() / pnl.std() if pnl.std() != 0 else 0
+        logger.info(f"Total PnL: {pnl.sum():.2f}")
+        logger.info(f"Sharpe Ratio: {sharpe:.2f}")
+    else:
+        logger.info("\nBacktest complete. FAILURE. No trades were generated.")
+    logger.info("--- Standalone Backtest Finished ---")
+
+
+if __name__ == '__main__':
+    # A simple formula that should clearly generate trades with the dummy data.
+    # Signal is TRUE when close > 102.5
+    example_formula = ["close", ">", 102.5]
+    
+    run_standalone_backtest(example_formula)

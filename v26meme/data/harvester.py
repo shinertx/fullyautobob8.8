@@ -21,18 +21,9 @@ def _sync(val):  # always defined before any use
 from v26meme.core.state import StateManager
 from v26meme.data.checkpoints import Checkpoints
 from v26meme.data.token_bucket import TokenBucket
-from v26meme.data.quality import validate_frame, atomic_write_parquet
+from v26meme.data.quality import validate_frame, atomic_write_parquet, TF_MS
 from v26meme.registry.canonical import make_canonical, venue_symbol_for
 
-TF_MS = {
-    "1m": 60_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "6h": 21_600_000,  # added for coinbase aliasing
-    "1d": 86_400_000,
-}
 
 # NEW -----------------------------------------------------------------
 @dataclass
@@ -160,7 +151,7 @@ def _write_partitioned_parquet(base_dir: Path, exchange: str, tf_resolved: str, 
     return max_ts_ms
 
 # NEW helper: optional sparse flat-fill (zero-volume synthetic bars) for moderate gaps
-def _flat_fill_sparse(df: pd.DataFrame, tf_ms: int, max_fill_bars: int = 120) -> pd.DataFrame:
+def _flat_fill_sparse(df: pd.DataFrame, tf_ms: int, max_fill_bars: int) -> pd.DataFrame:
     try:
         if df.empty: return df
         df = df.sort_values('timestamp').drop_duplicates('timestamp')
@@ -623,6 +614,7 @@ def _maybe_aggregate_timeframes(cfg: dict, state: 'StateManager', base_dir: Path
             if ohlc.empty:
                 continue
             ohlc = ohlc.reset_index()
+            ohlc['is_synthetic_aggregated'] = True  # Add synthetic flag
             out_path = base_dir / ex_id / target_tf / f"{now.year:04d}" / f"{now.month:02d}" / f"{canonical}.parquet"
             # Merge with existing if present
             if out_path.exists():
@@ -813,9 +805,13 @@ def run_once(cfg, state: StateManager, partial_mode: bool | None = None):
                                     since = new_since
                     except Exception:
                         pass
+                
                 limit = 1000
-                if ex_id == 'coinbase':
-                    limit = 300
+                try:
+                    limit = int(cfg['harvester']['limits_by_venue'][ex_id]['ohlcv_limit'])
+                except (KeyError, TypeError):
+                    pass # use default
+
                 all_rows: List[Dict[str, Any]] = []
                 last_ts = since
                 try:
@@ -878,7 +874,8 @@ def run_once(cfg, state: StateManager, partial_mode: bool | None = None):
                         except Exception as e:
                             logger.warning(f"fallback fetch failed {ex_id} {canonical} {fb_tf}: {e}")
                 if qa['degraded'] and float(qa.get('gap_ratio',1.0)) <= gap_cap * 1.05:
-                    ff = _flat_fill_sparse(qa['df'], tf_ms)
+                    max_fill = int(cfg.get('harvester', {}).get('max_flat_fill_bars', 120))
+                    ff = _flat_fill_sparse(qa['df'], tf_ms, max_fill_bars=max_fill)
                     if len(ff) > len(qa['df']):
                         try:
                             qa2 = validate_frame(ff, tf_ms, max_gap_pct=gap_cap)

@@ -3,6 +3,9 @@ from loguru import logger
 from statistics import mean
 import math, time
 
+from v26meme.core.dsl import Alpha
+
+
 class LaneAllocationManager:
     """
     Dynamically scales lane budgets (core vs moonshot) based on recent risk-adjusted lane performance.
@@ -17,13 +20,12 @@ class LaneAllocationManager:
         self.cfg = cfg.get('lanes', {})
         self.state = state
 
-    def _lane_stats(self, active_alphas: List[Dict]) -> Dict[str, float]:
+    def _lane_stats(self, active_alphas: List[Alpha]) -> Dict[str, float]:
         lanes = {}
         for a in active_alphas:
-            lane = a.get('lane', 'core')
-            s = (a.get('performance', {}).get('all', {}) or {}).get('sortino', None)
+            s = a.sortino()
             if s is None: continue
-            lanes.setdefault(lane, []).append(float(s))
+            lanes.setdefault(a.lane, []).append(float(s))
         return {k: mean(v) for k, v in lanes.items() if v}
 
     def _smooth(self, key: str, value: float) -> float:
@@ -66,19 +68,17 @@ class LaneAllocationManager:
         self.state.set('lane:moonshot:last_budget', moon_target)
         return {'core': core_target, 'moonshot': moon_target}
 
-    def _apply_probation(self, weights: Dict[str, float], active_alphas: List[Dict]) -> Dict[str, float]:
+    def _apply_probation(self, weights: Dict[str, float], active_alphas: List[Alpha]) -> Dict[str, float]:
         prob_cfg = self.cfg.get('probation', {})
         trades_min = int(prob_cfg.get('trades_min', 50))
         cap = float(prob_cfg.get('weight_cap', 0.03))
         changed = False
         out = {}
         for a in active_alphas:
-            aid = a['id']
+            aid = a.id
             w = weights.get(aid, 0.0)
-            perf = (a.get('performance') or {}).get('all', {})
-            n_tr = int(perf.get('n_trades', 0))
-            lane = a.get('lane', 'core')
-            if lane == 'moonshot' and n_tr < trades_min and w > cap:
+            n_tr = a.trades()
+            if a.lane == 'moonshot' and n_tr < trades_min and w > cap:
                 w = cap
                 changed = True
             out[aid] = w
@@ -86,7 +86,7 @@ class LaneAllocationManager:
             logger.info(f"Applied probation cap to some moonshot weights (cap={cap})")
         return out
 
-    def _maybe_retag(self, active_alphas: List[Dict]) -> int:
+    def _maybe_retag(self, active_alphas: List[Alpha]) -> int:
         rcfg = (self.cfg.get('retag') or {})
         if not rcfg.get('enabled', True):
             return 0
@@ -96,24 +96,23 @@ class LaneAllocationManager:
         max_mdd = float(rcfg.get('max_mdd', 0.25))
         retagged = 0
         for a in active_alphas:
-            if a.get('lane') == 'moonshot':
-                perf = (a.get('performance') or {}).get('all', {})
-                if (perf.get('n_trades',0) >= min_tr and perf.get('sharpe',0) >= min_sh and
-                    perf.get('sortino',0) >= min_so and perf.get('mdd',1) <= max_mdd):
-                    a['lane'] = 'core'
+            if a.lane == 'moonshot':
+                if (a.trades() >= min_tr and a.sharpe() >= min_sh and
+                    a.sortino() >= min_so and a.mdd() <= max_mdd):
+                    a.lane = 'core'
                     retagged += 1
         if retagged:
             logger.info(f"Retagged {retagged} moonshot→core alphas")
         return retagged
 
-    def apply_lane_budgets(self, alpha_weights: Dict[str, float], active_alphas: List[Dict]) -> Dict[str, float]:
+    def apply_lane_budgets(self, alpha_weights: Dict[str, float], active_alphas: List[Alpha]) -> Dict[str, float]:
         if not alpha_weights: return {}
         # Retag pass (A)
         self._maybe_retag(active_alphas)  # modifies in-place
         stats = self._lane_stats(active_alphas)
         budgets = self._budgets_from_stats(stats)
         lane_sum = {'core': 0.0, 'moonshot': 0.0}
-        alpha_lane = {a['id']: a.get('lane','core') for a in active_alphas}
+        alpha_lane = {a.id: a.lane for a in active_alphas}
         for aid, w in alpha_weights.items():
             lane_sum[alpha_lane.get(aid, 'core')] += float(w)
         out = {}
