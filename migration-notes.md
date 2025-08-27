@@ -682,3 +682,117 @@ Rollback if: cycle latency >2x AND no pvals_med improvement after 12 generations
 
 ## 2025-08-22 Harvester Bootstrap Defaults Added
 Added `harvester.bootstrap_days_default` mapping (1m:2, 5m:7, 15m:14, 1h:45, 4h:120, 1d:365) to remove KeyError in `harvester.run_once` and make historical depth explicit & tunable (replaces implicit 30d fallback). Guards staged_backfill logic and deep_backfill_override coverage checks.
+
+## 2025-08-23 Progressive Gate Staging + Bootstrap P-Value Integration
+
+Changes:
+- Added progressive gate stages (`discovery.gate_stages`) enabling staged tightening of statistical & trade-count thresholds.
+- Configurable escalation criteria via `discovery.gate_stage_escalation` (survivor_density_min, median_trades_min, patience_cycles).
+- Hyper Lab now tags rejection reasons with stage suffix (e.g., `pval_stage_relaxed`, `dsr_stage_tight`).
+- Bootstrap p-value path integrated in `panel_cv_stats` (activation when total OOS trades < `validation.bootstrap.min_trades`).
+- Telemetry keys:
+  - `eil:gate:stage` current stage name.
+  - `eil:gate:history` escalation events with cycle + metrics.
+  - `eil:gate:diagnostic` per-cycle survivor_density & median_trades snapshot.
+
+New Config Keys (config.yaml):
+```yaml
+discovery:
+  gate_stages:
+    - name: relaxed
+      fdr_alpha: 0.20
+      dsr_min_prob: 0.40
+      min_trades: 10
+    - name: normal
+      fdr_alpha: 0.12
+      dsr_min_prob: 0.55
+      min_trades: 25
+    - name: tight
+      fdr_alpha: 0.08
+      dsr_min_prob: 0.65
+      min_trades: 40
+  gate_stage_escalation:
+    survivor_density_min: 0.05
+    median_trades_min: 20
+    patience_cycles: 3
+validation:
+  bootstrap:
+    enabled: true
+    n_iter: 500
+    min_trades: 60
+    seed: 1337
+    method: basic
+```
+
+Operational Impact:
+- Early cycles pass more candidates (high fdr_alpha, low dsr/trade gates) to gather trade distribution stats; later stages tighten to control false discoveries.
+- Reduces premature over-tight filtering that can stall population evolution when data sparse.
+- Bootstrap improves p-value stability on low-trade candidate evaluations (avoids noisy t-stat on tiny samples).
+
+Verification Checklist:
+- [ ] Observe `eil:gate:stage` transitions in Redis after sufficient cycles meeting criteria.
+- [ ] Rejection telemetry includes stage-specific reasons.
+- [ ] Bootstrap path exercised: temporarily set `validation.bootstrap.min_trades` high (e.g. 10_000) and confirm p-values still emitted.
+- [ ] Promotions continue (not zero for >10 cycles) after reaching `tight` stage; if stall occurs, reassess `fdr_alpha` values.
+
+Rollback:
+- Remove `gate_stages` block (defaults to single implicit stage) and delete escalation block.
+- Disable bootstrap by setting `validation.bootstrap.enabled=false`.
+
+Risks / Mitigations:
+- Overly aggressive late-stage thresholds could choke promotions → monitor `survivor_density`; if < half of `survivor_density_min` for 2× patience window, relax thresholds.
+- Misconfigured patience (0) may cause instant escalation; enforce patience ≥1 in config validation (future enhancement).
+
+## 2025-08-23 PBO Telemetry + Robustness Gate + Stagnation Adaptation
+
+Changes:
+- Added Probability of Backtest Overfitting (PBO) computation in `hyper_lab.py` per generation.
+  - Uses deterministic symbol splits (config knobs: `discovery.pbo_splits`, `discovery.pbo_min_symbols`).
+  - Telemetry key: `eil:pbo:last` with cycle, gen, pbo, formulas.
+- Integrated robustness probing gate (FeatureProber) post trades/DSR gate.
+  - Config knobs under `prober`: `enabled`, `perturbations`, `delta_fraction`, `min_robust_score`.
+  - Rejections counted with reason `robust_stage_<stage>`.
+- Implemented stagnation detector (median p-value plateau) adjusting mutation rates.
+  - Config block `discovery.stagnation`: `enabled`, `window`, `min_pval_delta`, `mutation_bump`.
+- Added temporary per-symbol avg return capture for PBO; cleared each generation (`eil:tmp:per_symbol_perf`).
+
+Config Additions (defaults if absent):
+```yaml
+discovery:
+  pbo_splits: 25
+  pbo_min_symbols: 4
+  stagnation:
+    enabled: true
+    window: 8
+    min_pval_delta: 0.02
+    mutation_bump: 0.15
+prober:
+  enabled: true
+  perturbations: 64
+  delta_fraction: 0.15
+  min_robust_score: 0.55
+```
+
+Operational Impact:
+- Elevated overfitting awareness: High PBO (>0.5) suggests batch performance inversion risk; consider tightening gates or increasing sample depth.
+- Fragile formulas filtered earlier, increasing survivor quality density but potentially lowering raw survivor count initially.
+- Mutation rate auto-bump combats search stagnation (avoid local maxima) while capped at 0.95.
+
+Verification Checklist:
+- [ ] Redis GET `eil:pbo:last` returns recent object with pbo field.
+- [ ] `eil:rej:counts` includes `robust_stage_<stage>` after some cycles.
+- [ ] Mutation threshold rate increases logged after prolonged stagnant p-value history (inspect `eil:stagnation:event`).
+- [ ] Promotions unaffected (still zero in sandbox if promotion limits set) unless gates intentionally loosened.
+
+Rollback:
+- Remove robustness gate: set `prober.enabled=false`.
+- Disable PBO: omit `pbo_splits` (or set 0) — function exits early with 0.0.
+- Disable stagnation: set `discovery.stagnation.enabled=false`.
+
+Risks / Mitigations:
+- Overly aggressive robustness threshold may reject too many candidates → lower `min_robust_score` (e.g. 0.45) temporarily.
+- High PBO without action: expand panel symbols or increase window days to deepen sample before relaxing gates.
+
+Monitoring:
+- Track trend of `eil:pbo:last.pbo`; aim for stability <0.25 over successive generations.
+- Observe survivor density vs. pre-robustness baseline; adjust gates to balance throughput.

@@ -25,6 +25,7 @@ class FeatureProber:
             return {"robust_score": 0.0, "base": base}
         base_mean = base.get("avg_return", 0.0); base_mdd = abs(base.get("mdd", 1.0))
         ok = 0
+        deltas = []
         for _ in range(self.k):
             import copy
             f2 = copy.deepcopy(formula)
@@ -41,4 +42,6 @@ class FeatureProber:
             if (base_mean >= 0 and res.get("avg_return", -1e9) >= 0) or (base_mean < 0 and res.get("avg_return", 1e9) < 0):
                 if abs(res.get("mdd", 1.0)) <= base_mdd * 1.25:
                     ok += 1
-        return {"robust_score": ok / float(self.k), "base": base}
+            if res:
+                deltas.append(res.get('avg_return',0.0) - base_mean)
+        return {"robust_score": ok / float(self.k), "base": base, "avg_return_deltas": deltas}

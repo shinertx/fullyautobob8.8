@@ -179,6 +179,7 @@ NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `pyt
 * **Combinatorial Purged CV (CPCV):** In addition to standard purged K-fold cross-validation, you can enable CPCV (set `discovery.cv_method: "cpcv"`) to evaluate strategies across multiple train/test fold combinations for more robust fitness estimates.
 * **Candle hygiene:** The Lakehouse data loader drops the latest OHLCV bar if it’s still in an open interval, preventing partial-bar lookahead. This check parses the timeframe (e.g. 1m, 1h) and omits any not-yet-closed candle from model data.
 * **Group C (2025-08-22) Diversity & Speciation:** Added structural feature-set Jaccard clustering (`discovery.diversity.*`) with diversity fitness weight (`fitness_extras.weights.diversity`), per-cycle telemetry `eil:diag:diversity`, greedy speciation clusters, diversity bonus (1 - median Jaccard), cluster size penalty, and promotion gate requiring ≥1 (≥2 for large populations) clusters to reduce convergence and factor crowding.
+* **PBO Telemetry & Robustness Gate (2025-08-23):** Added Probability of Backtest Overfitting (PBO) metric per generation (`eil:pbo:last`) using deterministic symbol splits (config: `discovery.pbo_splits`, `discovery.pbo_min_symbols`). Integrated robustness probing gate (FeatureProber) that perturb-tests strategy thresholds/operators (`prober.*` config) and rejects fragile formulas below `min_robust_score`. Introduced stagnation detector (tracks median p-value history; if improvement < `min_pval_delta` over `window` cycles, mutation rates bumped by `mutation_bump`) to escape local optima while preserving deterministic PIT correctness.
 
 ## 🌐 Data & Universe
 
@@ -234,6 +235,59 @@ Use Cases:
 - Rapidly identify dominant bottleneck (e.g. 80% p-value rejections → expand population / widen feature spans; trade count rejections → lower min_trades or extend window).
 - Monitor feature stability over time; continuity < threshold triggers suppression limiting overfitting to sporadic artifacts.
 - Preserve diversity & structural insight when primary correlation feature underpopulated via beta fallback.
+
+---
+
+## 🔁 Progressive Gate Staging (2025-08-23)
+
+Discovery now supports **multi-stage statistical gating**:
+
+```yaml
+discovery:
+  gate_stages:
+    - name: relaxed   # exploratory breadth
+      fdr_alpha: 0.20
+      dsr_min_prob: 0.40
+      min_trades: 10
+    - name: normal    # consolidation
+      fdr_alpha: 0.12
+      dsr_min_prob: 0.55
+      min_trades: 25
+    - name: tight     # capital-ready rigor
+      fdr_alpha: 0.08
+      dsr_min_prob: 0.65
+      min_trades: 40
+  gate_stage_escalation:
+    survivor_density_min: 0.05
+    median_trades_min: 20
+    patience_cycles: 3
+validation:
+  bootstrap:
+    enabled: true
+    n_iter: 500
+    min_trades: 60
+    seed: 1337
+    method: basic
+```
+
+Mechanics:
+- Each EIL cycle computes `survivor_density = accepts/population` and `median_trades` of accepted formulas.
+- When both metrics exceed escalation thresholds for `patience_cycles` successive qualifying cycles, stage advances.
+- Stage overrides base `fdr_alpha`, `dsr_min_prob`, and trade gate.
+- Rejection telemetry keys now suffixed with stage (e.g. `pval_stage_relaxed`).
+
+Benefits:
+- Prevents early over-tight gating that starves evolutionary diversity.
+- Tightens statistical rigor only after population demonstrates evaluability depth.
+- Stage-aware rejection analytics accelerate diagnosis of bottleneck (p-values vs trades vs DSR).
+
+Bootstrap Path:
+- For low trade-count evaluations (`total_oos_trades < validation.bootstrap.min_trades`), a deterministic bootstrap p-value replaces parametric t-test.
+- Stabilizes early-stage significance estimates, reducing false negatives from high variance tiny samples.
+
+Operational Tips:
+- If promotions halt post-escalation, relax the final stage `fdr_alpha` slightly (e.g. 0.08 → 0.10) or raise `survivor_density_min` to delay tightening.
+- To debug bootstrap activation, temporarily set `validation.bootstrap.min_trades` very large (e.g. 10000) and confirm p-values persist.
 
 ---
 

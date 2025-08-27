@@ -60,6 +60,12 @@ validation:
   sparse_trades:         # NEW: adaptive p-value path for low trade counts
     enabled: true
     winrate_p_threshold_trades: 25  # use binomial win-rate test when total trades < this
+  bootstrap:               # NEW: bootstrap p-value configuration
+    enabled: true
+    n_iter: 500
+    min_trades: 60          # trade count below which bootstrap overrides t-test
+    seed: 1337
+    method: basic
 
 discovery:
   population_size: 320              # bumped 160→320
@@ -83,6 +89,23 @@ discovery:
     max_mdd: 0.30         # TEMP RELAX (was 0.20)
     min_sharpe: 0.30      # TEMP RELAX (was 1.10)
     min_win_rate: 0.45    # TEMP RELAX (was 0.52)
+  gate_stages:              # NEW: progressive gate staging
+    - name: relaxed
+      fdr_alpha: 0.25
+      dsr_min_prob: 0.40
+      min_trades: 20
+    - name: normal
+      fdr_alpha: 0.20
+      dsr_min_prob: 0.50
+      min_trades: 30
+    - name: tight
+      fdr_alpha: 0.12
+      dsr_min_prob: 0.60
+      min_trades: 40
+  gate_stage_escalation:    # NEW: escalation criteria
+    survivor_density_min: 0.05   # survivors / population
+    median_trades_min: 25
+    patience_cycles: 3
   factor_correlation_max: 0.80
   enforce_current_gates_on_start: false   # NEW: retroactive gate enforcement for legacy alphas
   max_return_padding_trim: 5              # NEW: max trailing zero returns to trim per hygiene pass
