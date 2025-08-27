@@ -876,3 +876,6 @@ def _sync_and_run_screener(cfg: Dict[str, Any], state: StateManager) -> Tuple[Li
     except Exception as e:
         logger.error(f"Screener run failed: {e}")
         return [], False
+
+if __name__ == "__main__":
+    cli()
