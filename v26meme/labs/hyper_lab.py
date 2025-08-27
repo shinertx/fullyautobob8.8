@@ -159,6 +159,21 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
 
     PIT NOTE: Operates solely on already-harvested lakehouse data; no forward leakage.
     """
+    # --- Import path hygiene guard (stale install detection) ---
+    try:
+        import v26meme as _vmod
+        repo_root = Path(__file__).resolve().parents[2]  # project root (fullyautobob8.8)
+        mod_path = Path(_vmod.__file__).resolve()
+        if repo_root not in mod_path.parents:
+            msg = f"IMPORT_PATH_MISMATCH module_path={mod_path} repo_root={repo_root} (editable install missing?)"
+            if os.environ.get('ALLOW_IMPORT_PATH_MISMATCH') != '1':
+                raise RuntimeError(msg)
+            else:
+                logger.warning(msg)
+    except Exception as e:
+        logger.error(f"IMPORT_PATH_CHECK_FAIL err={e}")
+        raise
+
     if cfg is None:
         cfg = load_config()
     assert isinstance(cfg, dict) and 'system' in cfg and 'discovery' in cfg and 'execution' in cfg and 'eil' in cfg
@@ -170,6 +185,11 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
         state.set('eil:cycle_idx', 0)
         start_idx = 0
         logger.info("EIL_FRESH_RESET applied (population_struct absent)")
+        # Reset continuity suppression accumulators to avoid stale long-horizon suppression
+        for k in ['eil:continuity_suppress','eil:feat:active_ct','eil:feat:cycles_ct','eil:population_hygiene']:
+            if state.get(k) is not None:
+                state.set(k, {}) if k != 'eil:continuity_suppress' else state.set(k, [])
+                logger.info(f"EIL_CONTINUITY_RESET key={k} cleared")
 
     # Gate staging config (ensure present each invocation)
     gate_stages_cfg = cfg['discovery'].get('gate_stages', []) or []
@@ -312,6 +332,35 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
 
             # Gate parameters & overrides
             fdr_alpha, dsr_min_prob, min_trades_gate = _apply_stage_overrides(state, cfg, current_stage, gate_stages_cfg)
+            # --- Adaptive min_trades gate ---
+            try:
+                # Gather recent trade count distribution from last generation diagnostics if present
+                # Fallback: estimate desired trades as function of panel size * bars window * activation rate proxy
+                gen_trade_samples = []
+                # Look back a few prior generation diagnostics (current cycle only) for trade stats
+                for gback in range(5):
+                    gdiag = state.get(f'eil:diag:gen:{cycle_idx}:{gback}') or {}
+                    tm = gdiag.get('trades_median')
+                    if isinstance(tm, (int, float)) and tm is not None:
+                        gen_trade_samples.append(float(tm))
+                if gen_trade_samples:
+                    median_recent = float(np.median(gen_trade_samples)) if hasattr(np, 'median') else sorted(gen_trade_samples)[len(gen_trade_samples)//2]
+                else:
+                    # Heuristic: expect at least one trade per symbol per 2% of bars-window (rough sparse baseline)
+                    bars_window = int(_parse_tf_bars(tf_selected, cfg['eil']['fast_window_days']))
+                    est = max(3, int(len(panel) * bars_window * 0.0002))
+                    median_recent = float(est)
+                # Scale baseline gate: require at most 1.25 * median_recent but not below configured min
+                adaptive_gate = max( int(cfg['discovery'].get('promotion_criteria', {}).get('min_trades', 10)), int(median_recent * 0.75) )
+                # Clamp to reasonable ceiling to avoid early starvation
+                adaptive_gate = max(5, min(adaptive_gate, int(median_recent * 1.25) + 5))
+                # Take the minimum between stage override gate and adaptive (adaptive should only loosen, not tighten excessively)
+                eff_gate = min_trades_gate if min_trades_gate <= adaptive_gate else adaptive_gate
+                if eff_gate != min_trades_gate:
+                    logger.info(f"EIL_ADAPT_MIN_TRADES old={min_trades_gate} adaptive={adaptive_gate} eff={eff_gate}")
+                min_trades_gate = eff_gate
+            except Exception as _e:
+                logger.warning(f"EIL_ADAPT_MIN_TRADES_FAIL err={_e}")
             validator.fdr_alpha = fdr_alpha
             validator.dsr_min_prob = dsr_min_prob
             validator.min_trades_gate = min_trades_gate
