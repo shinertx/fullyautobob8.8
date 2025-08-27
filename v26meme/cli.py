@@ -430,6 +430,30 @@ def cli() -> None:
     pass
 
 @cli.command()
+def check() -> None:
+    """Verify Redis connectivity and required config sections.
+
+    Returns non-zero on failure so deployment scripts can gate startup.
+    """
+    load_dotenv()
+    try:
+        cfg = load_config()
+    except SystemExit as e:  # propagate validation failure as Click error
+        raise click.ClickException(str(e)) from e
+
+    required = {"system", "execution", "eil"}
+    missing = sorted(required - set(cfg))
+    if missing:
+        raise click.ClickException(f"Missing config sections: {', '.join(missing)}")
+
+    try:
+        StateManager(cfg["system"]["redis_host"], cfg["system"]["redis_port"])
+    except Exception as e:
+        raise click.ClickException(f"Redis connection failed: {e}") from e
+
+    click.echo("environment ok")
+
+@cli.command()
 def reset_risk_halt() -> None:
     """Manually clear the risk:halt Redis key."""
     load_dotenv()
