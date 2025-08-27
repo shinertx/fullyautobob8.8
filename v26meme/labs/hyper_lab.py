@@ -148,6 +148,7 @@ def run():  # Plain function for programmatic/test use
     run_eil()
 
 def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    print("GEMINI_DEBUG: Entering run_eil")
     """Execute one or more Evolutionary Iteration Loop (EIL) cycles.
 
     This is the programmatic (non-Click) entrypoint used by tests to avoid Click
@@ -247,8 +248,7 @@ def run_eil(cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
 
     # Helper: record first rejection reason per formula - MOVED TO MODULE LEVEL
 
-    # MAIN EIL LOOP
-    max_cycles_cfg = int(cfg['eil'].get('max_cycles', 1))
+        max_cycles_cfg = int(cfg['eil'].get('max_cycles', 1))
     all_survivors_from_cycle: List[Dict[str, Any]] = []
     while True:
         try:
