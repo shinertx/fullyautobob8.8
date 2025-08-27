@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: v26meme
-Version: 4.7.5
-Summary: v26meme v4.7.5: Event-sourced data-plane, canonical registry, QA gates, OpenAI-only LLM, calibrated sim.
-Requires-Python: >=3.10

@@ -35,6 +35,8 @@ htmlcov/
 # Distribution files
 v26meme.egg-info/
 .dist/
+dist/
+build/
 
 # Streamlit files
 .streamlit/
@@ -44,6 +46,11 @@ v26meme.egg-info/
 
 # Logs
 logs/
+*.log
+loop.out
+loop.err
+hyper_lab.out
+dashboard.out
 
 # Misc
 loop_err.log
@@ -56,3 +63,15 @@ v26meme/data/universe_screener.py.new
 # local debug scripts
 test_crash.py
 tests/labs/debug_*.py
+debug_*.py
+dump_*.py
+
+# Data dumps
+*_dump.json
+initial_population.json
+
+# Runtime / ephemeral process artifacts (added for speed + cleanliness)
+*.pid
+*.out
+*.tgz
+population_dump.json
