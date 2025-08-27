@@ -429,12 +429,26 @@ def cli() -> None:
     """Root CLI group."""
     pass
 
+@cli.command()
+def reset_risk_halt() -> None:
+    """Manually clear the risk:halt Redis key."""
+    load_dotenv()
+    cfg = load_config()
+    state = StateManager(cfg["system"]["redis_host"], cfg["system"]["redis_port"])
+    
+    if state.get("risk:halt"):
+        state.r.delete("risk:halt")
+        logger.success("Risk halt key 'risk:halt' has been cleared.")
+    else:
+        logger.info("Risk halt key 'risk:halt' was not set. No action taken.")
+
 # --------------------------------------------------------------------------------------
 # Main Loop
 # --------------------------------------------------------------------------------------
 
 @cli.command()
 def loop() -> None:
+    print("GEMINI_DEBUG: Entering loop function")
     """Run the research + promotion loop (paper only).
 
     Safeguards:
@@ -474,9 +488,7 @@ def loop() -> None:
         level=cfg["system"]["log_level"].upper(),
         format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
     )
-
-    # NEW: Set specific logger level for v26meme.research.generator
-    logger.level("v26meme.research.generator", level="DEBUG")
+    logger.info("Logger reconfigured.")
 
     random.seed(cfg["system"].get("seed", 1337))
     configure_resolver(cfg.get("registry"))
@@ -487,6 +499,17 @@ def loop() -> None:
         logger.warning("LLM is OpenAI-only. Set llm.provider=openai and OPENAI_API_KEY in .env.")
 
     state = StateManager(cfg["system"]["redis_host"], cfg["system"]["redis_port"])
+    
+    # Check for persistent risk halt on startup
+    if state.get("risk:halt"):
+        logger.critical("="*80)
+        logger.critical("SYSTEM HALTED: 'risk:halt' key is set in Redis.")
+        logger.critical("The bot will not run until this key is cleared.")
+        logger.critical("To clear it, run the following command:")
+        logger.critical("python -m v26meme.cli reset-risk-halt")
+        logger.critical("="*80)
+        return # Exit the loop command
+
     _ensure_lakehouse_bootstrap(cfg, state)
 
     lakehouse = _make_lakehouse(cfg)
@@ -523,6 +546,12 @@ def loop() -> None:
         try:
             state.heartbeat()
             logger.info("--- New loop cycle ---")
+
+            # Log promotion cap status
+            promotions_today_count = len(state.get(_today_key("promotions")) or [])
+            max_promotions_day = int(cfg['discovery'].get('max_promotions_per_day', 1))
+            logger.info(f"Promotion status: {promotions_today_count}/{max_promotions_day} promotions used today.")
+
             # Hygiene pass early each cycle (pre-harvest to keep list small during scoring)
             try:
                 hg = _alpha_registry_hygiene(state, cfg)

@@ -90,6 +90,14 @@ class DiscoveryFitnessWeightsConfig(BaseModel):
     trade_signal: float
     complexity_penalty: Optional[float] = 0.0
 
+# NEW: promotion criteria sub-config to align schema with config.yaml usage
+class PromotionCriteriaConfig(BaseModel):
+    min_trades: Optional[int] = None
+    min_sortino: Optional[float] = None
+    min_sharpe: Optional[float] = None
+    min_win_rate: Optional[float] = None
+    max_mdd: Optional[float] = None
+
 class DiscoveryConfig(BaseModel):
     max_promotions_per_cycle: int
     max_promotions_per_day: int
@@ -123,6 +131,7 @@ class DiscoveryConfig(BaseModel):
     stagnation: DiscoveryStagnationConfig
     debug_relaxed_gates: bool
     fitness_weights: DiscoveryFitnessWeightsConfig
+    promotion_criteria: Optional[PromotionCriteriaConfig] = None  # <-- added
 
 class ProberConfig(BaseModel):
     enabled: bool
