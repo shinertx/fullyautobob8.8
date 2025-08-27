@@ -101,6 +101,7 @@ fullyautobob8.8/
 * **Screener → Lakehouse → FeatureFactory → Generator/EIL → CV+FDR → Promotion → Optimizer → Risk → Execution (paper/live) → Dashboard**
 * **Event-sourced harvester**: Lane-aware timeframes, resumable sync, quality gates, canonical joins.
 * **Extreme Iteration Layer (Hyper-Lab)**: Run 5k+ hypotheses/loop, publish survivors.
+* **Ensemble Intelligence**: A "meta-alpha" is created by combining the signals from the top-performing core alphas, resulting in a more robust and stable signal.
 * **Lane system**:
   * Core (95%) = stable edges
   * Moonshot (5%, dynamic) = top-gainers, resets every 2–4h
@@ -110,35 +111,116 @@ fullyautobob8.8/
 
 ---
 
-## ⚙️ Installation
+## ⚙️ How to Run
+
+This project is designed to run as a persistent, multi-process application using `tmux` to manage the main trading loop and the dashboards.
+
+### Prerequisites
+
+Before you begin, ensure you have the following installed:
+*   **Git**
+*   **Python 3.10+**
+*   **Redis**: Must be running and accessible. On Debian/Ubuntu, you can install and start it with:
+    ```bash
+    sudo apt-get update && sudo apt-get install redis-server
+    sudo systemctl enable --now redis-server
+    ```
+*   **tmux**: A terminal multiplexer used to run background processes.
+    ```bash
+    sudo apt-get install tmux
+    ```
+
+### 1. Installation
+
+First, clone the repository and navigate into the project directory:
+```bash
+git clone https://github.com/shinertx/fullyautobob8.8.git
+cd fullyautobob8.8
+```
+
+### 2. Configuration
+
+The system requires API keys and other secrets to be stored in a `.env` file.
+
+1.  Copy the example file:
+    ```bash
+    cp .env.example .env
+    ```
+2.  **Edit `.env`** and add your API keys, particularly `OPENAI_API_KEY`.
+
+### 3. Launching the System
+
+The included script automates the setup of a Python virtual environment and launches all necessary processes within a `tmux` session.
 
 ```bash
-git clone https://github.com/yourusername/v26meme.git
-cd v26meme
-
-# Install & launch (paper mode, default)
 ./install_and_launch_v475.sh
 ```
 
-> NOTE: Environments without a `python` shim now automatically detect `python3` in the launcher script. If invoking manually, use:
->
-> ```bash
-> python3 -m v26meme.cli loop
-> ```
+This script will:
+1.  Create a Python virtual environment at `.venv/`.
+2.  Install all required dependencies from `requirements.txt`.
+3.  Start four `tmux` sessions in the background:
+    *   `trading_session`: Runs the main `v26meme.cli loop`, which includes the harvester, alpha discovery, and execution logic.
+    *   `dashboard_session`: Serves the main Streamlit dashboard on port `8601`.
+    *   `hyper_lab`: Runs the headless Extreme Iteration Layer (EIL) process.
+    *   `hyper_lab_dashboard`: Serves the Hyper-Lab (EIL) dashboard on port `8610`.
 
-NOTE: Some minimal Debian/Ubuntu images do not provide a `python` shim; use `python3` explicitly (all examples below updated).
+### 4. Accessing the Dashboards
 
-**Dependencies pinned** in `requirements.txt`.  
-**Dashboards / Labs:**
-- Dashboard: http://localhost:8601 (Streamlit GUI)
-- Hyper Lab Dashboard: http://localhost:8610 (EIL survivors & metrics)
-- Hyper Lab (headless batch EIL) reserved port env: HYPER_LAB_PORT=8610 (no HTTP server yet; future UI can bind here)
+Once the system is running, you can access the web interfaces:
 
-**Dashboard:** http://localhost:8601
+*   **Main Dashboard**: [http://localhost:8601](http://localhost:8601)
+*   **Hyper Lab Dashboard**: [http://localhost:8610](http://localhost:8610)
+
+### 5. Managing the Sessions
+
+You can attach to the `tmux` sessions to view logs or manage the processes.
+
+*   **List sessions**:
+    ```bash
+    tmux ls
+    ```
+*   **Attach to the main loop session**:
+    ```bash
+    tmux attach -t trading_session
+    ```
+    *(Press `Ctrl+b` then `d` to detach)*
+
+*   **Stop all sessions and kill the bot**:
+    ```bash
+    tmux kill-session -t trading_session
+    tmux kill-session -t dashboard_session
+    tmux kill-session -t hyper_lab
+    tmux kill-session -t hyper_lab_dashboard
+    ```
+
+### Manual Execution
+
+If you prefer to run the components manually without the launch script:
+
+1.  **Set up the environment**:
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    ```
+2.  **Run the main loop**:
+    ```bash
+    python3 -m v26meme.cli loop
+    ```
+3.  **Run the main dashboard** (in a separate terminal):
+    ```bash
+    streamlit run dashboard/app.py --server.port 8601
+    ```
+4.  **Run the Hyper Lab dashboard** (in a separate terminal):
+    ```bash
+    streamlit run dashboard/hyper_lab_app.py --server.port 8610
+    ```
 
 ---
 
 ## 📊 Dashboard
+
 
 * Equity & drawdown charts
 * Portfolio allocations & active alphas
@@ -338,6 +420,20 @@ Covers:
 * Unified tick-level simulator.
 * Meta-RL optimizer for generator parameters.
 * Dynamic venue scaling (DEX connectors).
+
+---
+
+## Dashboards
+
+The system includes two Streamlit dashboards for monitoring:
+
+1.  **Main Dashboard**: Provides an overview of portfolio performance, equity curve, and active trading strategies.
+    - **URL**: `http://localhost:8601`
+    - **Command**: `streamlit run dashboard/app.py --server.port 8601`
+
+2.  **Hyper Lab Dashboard**: Shows the status of the strategy discovery process (EIL), including survivor candidates and feature analysis.
+    - **URL**: `http://localhost:8610`
+    - **Command**: `streamlit run dashboard/hyper_lab_app.py --server.port 8610`
 
 ---
 

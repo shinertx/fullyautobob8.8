@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Any, Dict, List, Tuple, Optional, cast
+from typing import Any, Dict, List, Tuple, Optional, cast, Union
 
 import redis
 from loguru import logger
@@ -32,8 +32,8 @@ class StateManager:
             return raw
 
     # --------------------- simple KV ----------------------------
-    def set(self, key: str, value: Any) -> None:
-        self.r.set(key, json.dumps(value))
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        self.r.set(key, json.dumps(value), ex=ttl)
 
     def get(self, key: str) -> Any:
         raw = cast(Optional[str], self.r.get(key))
@@ -46,6 +46,16 @@ class StateManager:
     def hget(self, key: str, field: str) -> Any:
         raw = cast(Optional[str], self.r.hget(key, field))
         return self._json_load(raw)
+
+    def hkeys_sync(self, key: str) -> List[str]:
+        """Synchronously get all keys in a hash, ensuring string output."""
+        # The client is sync, but type hints can be ambiguous. This method provides a
+        # clear, synchronous interface, ignoring the incorrect Awaitable hint.
+        keys_raw = self.r.hkeys(key)
+        # The type checker incorrectly infers an Awaitable. We cast it.
+        iterable_keys = cast(List[Union[str, bytes]], keys_raw)
+        # decode_responses=True should handle this, but as a safeguard:
+        return [k.decode('utf-8') if isinstance(k, bytes) else str(k) for k in (iterable_keys or [])]
 
     # --------------------- batch ops ----------------------------
     def multi_set(self, mapping: Dict[str, Any]) -> None:
@@ -124,6 +134,15 @@ class StateManager:
                 out.append((g, total_fit / cnt_f))
         out.sort(key=lambda x: x[1], reverse=True)
         return out[:top_n]
+
+    def set_ensemble_definition(self, definition: Dict[str, Any]) -> None:
+        self.set('ensemble_definition', definition)
+
+    def get_ensemble_definition(self) -> Optional[Dict[str, Any]]:
+        val = self.get('ensemble_definition')
+        if isinstance(val, dict):
+            return val
+        return None
 
     # --------------------- heartbeat ----------------------------
     def heartbeat(self) -> None:

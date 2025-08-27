@@ -36,3 +36,14 @@ def test_feature_prober_scores():
     res = prober.score(df, formula)
     assert 'robust_score' in res
     assert 0.0 <= res['robust_score'] <= 1.0
+
+
+def test_feature_prober_mdd_multiplier_relaxation():
+    np.random.seed(1337)
+    df = _make_df()
+    formula = ["return_1p", ">", 0.0]
+    tight = FeatureProber(fees_bps=10, slippage_bps=5, perturbations=12, delta_fraction=0.1, seed=42, mdd_escalation_multiplier=1.10)
+    relaxed = FeatureProber(fees_bps=10, slippage_bps=5, perturbations=12, delta_fraction=0.1, seed=42, mdd_escalation_multiplier=1.50)
+    tight_res = tight.score(df, formula)
+    relaxed_res = relaxed.score(df, formula)
+    assert relaxed_res['robust_score'] >= tight_res['robust_score']

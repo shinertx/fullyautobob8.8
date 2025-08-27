@@ -4,7 +4,7 @@ PIT-safe: Read-only telemetry from event-sourced Redis state
 """
 import streamlit as st
 import pandas as pd
-import redis
+import redis, yaml
 import json
 import time
 import plotly.express as px
@@ -37,14 +37,116 @@ def get_state(key: str) -> Optional[Any]:
     except json.JSONDecodeError:
         return None
 
+@st.cache_data(ttl=60)
+def load_config():
+    """Load config from YAML, cached for 60s."""
+    try:
+        with open("configs/config.yaml", "r") as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        st.error("configs/config.yaml not found.")
+        return {}
+
 def equity_curve() -> List[Dict[str, Any]]:
     """Fetch equity curve from sorted set"""
     return [json.loads(v) for v in r.zrange('equity_curve', 0, -1)]
 
+@st.cache_data(ttl=10)
+def get_llm_history():
+    """Fetch LLM proposal and injection history from Redis sorted sets."""
+    dfs = []
+    
+    # Proposals
+    proposals_raw = r.zrange('llm:proposer:history', 0, -1, withscores=False)
+    if proposals_raw:
+        proposals = [json.loads(p) for p in proposals_raw]
+        prop_df = pd.DataFrame(proposals).rename(columns={'generated': 'count'})
+        prop_df['type'] = 'Proposed'
+        dfs.append(prop_df)
+
+    # Injections
+    injections_raw = r.zrange('eil:llm_injection:history', 0, -1, withscores=False)
+    if injections_raw:
+        injections = [json.loads(i) for i in injections_raw]
+        inj_df = pd.DataFrame(injections).rename(columns={'injected': 'count'})
+        inj_df['type'] = 'Injected'
+        dfs.append(inj_df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df = pd.concat(dfs)
+    df['ts'] = pd.to_datetime(df['ts'], unit='s')
+    return df.sort_values('ts')
+
 st.title("🧠 v26meme v4.7.5 — Autonomous Alpha Factory [PAPER MODE]")
 st.caption("Doctrine: $200 → $1M in 30 days | PIT-correct | No magic numbers | Paper-first")
 
-# Key metrics
+# --- Discovery & Guardrail Status ---
+st.subheader("Discovery & Guardrail Status")
+
+cfg = load_config()
+# Fetch real-time telemetry
+gate_stage = r.get('gate:stage:current') or "default"
+gate_cfg = get_state('eil:gate:current_config') or {}
+diagnostic = get_state('eil:gate:diagnostic') or {}
+coverage = get_state('coverage:panel:1h') or {}
+pbo = get_state('eil:pbo:last') or {}
+heartbeat = r.get('loop:heartbeat')
+last_update_ago = (int(time.time()) - int(heartbeat)) if heartbeat else None
+
+if last_update_ago is not None and last_update_ago > 120:
+    st.warning(f"LOOP STALLED: Last heartbeat {last_update_ago}s ago")
+else:
+    st.success(f"LOOP OK: Last heartbeat {last_update_ago}s ago" if last_update_ago is not None else "LOOP OK")
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Discovery Stage", gate_stage.capitalize())
+k2.metric("FDR α-level", f"{gate_cfg.get('fdr_alpha', 0.0):.2f}")
+k3.metric("DSR Min Prob", f"{gate_cfg.get('dsr_min_prob', 0.0):.2f}")
+k4.metric("Survivor Density", f"{(diagnostic.get('survivor_density', 0) * 100):.2f}%")
+k5.metric("PBO (Overfit Prob)", f"{(pbo.get('pbo', 0) * 100):.1f}%")
+
+with st.expander("View More Diagnostics"):
+    st.json({
+        "gate_config": gate_cfg,
+        "coverage_1h": coverage,
+        "pbo_details": pbo
+    })
+
+# --- LLM & EIL Injection Status ---
+st.subheader("LLM Strategy Injection")
+llm_cfg = cfg.get('llm', {})
+
+l1, l2, l3, l4 = st.columns(4)
+l1.metric("LLM Proposer", "✅ Enabled" if llm_cfg.get('enable') else "❌ Disabled")
+
+last_proposal_run = get_state('llm:proposer:last_run') or {}
+last_injection_run = get_state('eil:llm_injection:last_run') or {}
+
+if last_proposal_run:
+    last_prop_ts = last_proposal_run.get('ts', 0)
+    last_prop_ago = int(time.time() - last_prop_ts) if last_prop_ts > 0 else -1
+    l2.metric("Last Proposal", f"{last_prop_ago}s ago" if last_prop_ago >= 0 else "Never", help=f"Seeded with: {last_proposal_run.get('seeded_with', 'N/A')}")
+    l3.metric("Proposals Generated", last_proposal_run.get('generated', 0))
+else:
+    l2.metric("Last Proposal", "Never")
+    l3.metric("Proposals Generated", 0)
+
+if last_injection_run:
+    l4.metric("Proposals Injected (EIL)", last_injection_run.get('injected', 0))
+else:
+    l4.metric("Proposals Injected (EIL)", 0)
+
+history_df = get_llm_history()
+if not history_df.empty:
+    st.plotly_chart(
+        px.bar(history_df, x='ts', y='count', color='type', title='LLM Proposal & Injection History (Last 1000 Cycles)',
+               labels={'ts': 'Time', 'count': 'Formula Count', 'type': 'Action'}, barmode='group'),
+        use_container_width=True)
+
+# --- Key metrics ---
+st.subheader("Portfolio Status")
 portfolio = get_state('portfolio') or {}
 active_alphas = get_state('active_alphas') or []
 target_weights = get_state('target_weights') or {}

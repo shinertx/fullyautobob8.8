@@ -1,6 +1,6 @@
 # v26meme/cli.py — v4.7.5 (event‑sourced data plane, canonical joins, calibrated sim, lanes)
 from __future__ import annotations
-import os, time, json, hashlib, random, inspect
+import os, time, json, hashlib, random, inspect, sys
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
@@ -14,26 +14,25 @@ import numpy as np
 import glob as _glob  # added for retro coverage reindex
 
 from v26meme.core.state import StateManager
+from v26meme.core.config import RootConfig
 from v26meme.data.lakehouse import Lakehouse
 from v26meme.data.universe_screener import UniverseScreener
 from v26meme.data.screener_store import ScreenerStore
 from v26meme.data.top_gainers import compute_top_gainers_bases
-from v26meme.research.feature_factory import FeatureFactory
-from v26meme.research.generator import GeneticGenerator
-from v26meme.research.validation import panel_cv_stats, benjamini_hochberg, deflated_sharpe_ratio
-from v26meme.research.feature_prober import FeatureProber
-from v26meme.labs.simlab import SimLab
+from v26meme.llm.proposer import LLMProposer
 from v26meme.allocation.optimizer import PortfolioOptimizer
 from v26meme.allocation.lanes import LaneAllocationManager
 from v26meme.execution.exchange import ExchangeFactory
 from v26meme.execution.handler import ExecutionHandler
 from v26meme.execution.risk import RiskManager
-from v26meme.core.dsl import Alpha
-from v26meme.llm.proposer import LLMProposer
+from v26meme.core.dsl import Alpha, normalize_survivor_to_alpha
 from v26meme.analytics.adaptive import publish_adaptive_knobs
+from v26meme.analytics.ensemble import EnsembleManager
 from v26meme.registry.resolver import configure as configure_resolver
 from v26meme.registry.catalog import CatalogManager
 from v26meme.data.harvester import run_once as harvest_once  # event-sourced incremental OHLCV harvest
+
+from v26meme.labs.hyper_lab import run_eil
 
 # --------------------------------------------------------------------------------------
 # Hygiene
@@ -47,24 +46,26 @@ def _alpha_registry_hygiene(state: StateManager, cfg: Dict[str, Any]) -> Dict[st
     inflating correlation / variance metrics.
     """
     changed = {"dupes_removed":0, "trimmed":0, "dropped_gates":0, "final":0}
-    alphas = state.get_active_alphas()
-    if not alphas:
+    alpha_dicts = state.get_active_alphas()
+    if not alpha_dicts:
         return changed
-    seen = set(); clean: List[Dict[str, Any]] = []
+    
+    alphas = [Alpha.model_validate(a) for a in alpha_dicts]
+
+    seen = set(); clean: List[Alpha] = []
     crit = (cfg.get('discovery') or {}).get('promotion_criteria', {})
     enforce = bool((cfg.get('discovery') or {}).get('enforce_current_gates_on_start', False))
     max_trim = int((cfg.get('discovery') or {}).get('max_return_padding_trim', 5))
     for a in alphas:
-        aid = a.get('id');
-        if not aid:
+        if not a.id:
             continue
-        if aid in seen:
+        if a.id in seen:
             changed["dupes_removed"] += 1
             continue
-        seen.add(aid)
+        seen.add(a.id)
         
         # Get performance dict, creating nested structure if needed
-        perf = a.get('performance', {}).get('all', {})
+        perf = a.performance.get('all', {})
         returns = list(perf.get('returns') or [])
         n_trades = int(perf.get('n_trades') or 0)
         
@@ -73,24 +74,13 @@ def _alpha_registry_hygiene(state: StateManager, cfg: Dict[str, Any]) -> Dict[st
             extra = returns[n_trades:]
             if all((r or 0) == 0 for r in extra) and len(extra) <= max_trim:
                 # Trim to n_trades and properly update the nested structure
-                trimmed_returns = returns[:n_trades]
-                # Create new perf dict with trimmed returns
-                new_perf = dict(perf)
-                new_perf['returns'] = trimmed_returns
-                new_perf['n_trades'] = n_trades  # ensure it's set
-                # Update the alpha dict properly
-                a = dict(a)  # shallow copy
-                a['performance'] = {'all': new_perf}
-                if 'performance' in a and isinstance(a['performance'], dict):
-                    for k in a['performance']:
-                        if k != 'all':
-                            a['performance'][k] = a['performance'][k]
+                a.performance['all']['returns'] = returns[:n_trades]
                 changed['trimmed'] += 1
         
         # Gate enforcement
         if enforce:
             # Re-fetch perf in case it was modified
-            perf = a.get('performance', {}).get('all', {})
+            perf = a.performance.get('all', {})
             buf = float(cfg.get('discovery', {}).get('promotion_buffer_multiplier', 1.0))
             if (perf.get('n_trades',0) < crit.get('min_trades',0) or
                 perf.get('sortino',0) < crit.get('min_sortino',0) * buf or
@@ -101,8 +91,9 @@ def _alpha_registry_hygiene(state: StateManager, cfg: Dict[str, Any]) -> Dict[st
                 continue
         clean.append(a)
     # Single write after processing all
-    if clean != alphas:
-        state.set_active_alphas(clean)
+    clean_dicts = [alpha.model_dump() for alpha in clean]
+    if clean_dicts != alpha_dicts:
+        state.set_active_alphas(clean_dicts)
     changed['final'] = len(clean)
     return changed
 
@@ -110,12 +101,33 @@ def _alpha_registry_hygiene(state: StateManager, cfg: Dict[str, Any]) -> Dict[st
 # Helpers
 # --------------------------------------------------------------------------------------
 
+def _extract_features_from_formula(node: Any) -> set[str]:
+    """Recursively extract unique feature names from a formula structure."""
+    features = set()
+    if not isinstance(node, list):
+        return features
+    # Base case: a condition like ['feature_name', '>', 0.5]
+    if len(node) >= 3 and isinstance(node[0], str) and node[1] in ('>', '<'):
+        features.add(node[0])
+    # Recursive step: a logical combination like [ [cond1], 'AND', [cond2] ]
+    elif len(node) >= 3 and isinstance(node[0], list) and isinstance(node[2], list):
+        features.update(_extract_features_from_formula(node[0]))
+        features.update(_extract_features_from_formula(node[2]))
+    return features
+
+
 def load_config(file: str = "configs/config.yaml") -> Dict[str, Any]:
-    """Load YAML config.
-    PIT note: Config carries only lag/embargo parameters; no forward info embedded.
-    """
-    with open(file, "r") as f:  # noqa: P103
-        return yaml.safe_load(f)
+    """Load YAML config and validate against Pydantic schema."""
+    with open(file, "r") as f:
+        raw_config = yaml.safe_load(f)
+    
+    try:
+        validated_config = RootConfig.model_validate(raw_config)
+        logger.info("Configuration validated successfully.")
+        return validated_config.model_dump()
+    except Exception as e:
+        logger.error(f"Configuration validation failed: {e}")
+        raise SystemExit("Exiting due to invalid configuration.") from e
 
 def lagged_zscore(s: pd.Series, lookback: int | None = None, cfg: Dict[str, Any] | None = None) -> pd.Series:
     """Point‑in‑time safe z‑score (uses only prior data via shift).
@@ -190,7 +202,7 @@ def _today_key(prefix: str = "promotions") -> str:  # YYYY-MM-DD key
 def _retro_reindex_coverage(state: StateManager, cfg: Dict[str, Any], tf: str) -> None:
     """Retroactively populate or upgrade harvest:coverage entries from existing parquet history.
 
-    PIT note: Derives solely from already persisted on-disk OHLCV parquet partitions; no
+    PIT note: Derives solely from already persisted on-disk OHLCV partitions; no
     forward-looking data introduced. One-shot per timeframe (idempotent via state flag).
 
     Rationale: Historical deep backfill (copied / aggregated) created large parquet depth
@@ -235,7 +247,7 @@ def _retro_reindex_coverage(state: StateManager, cfg: Dict[str, Any], tf: str) -
                             if isinstance(existing_raw, bytes):
                                 existing_raw_dec = existing_raw.decode('utf-8')
                             else:
-                                existing_raw_dec = existing_raw  # type: ignore[assignment]
+                                existing_raw_dec = str(existing_raw)
                             existing = json.loads(existing_raw_dec)
                         except Exception:
                             existing = {}
@@ -259,11 +271,11 @@ def _retro_reindex_coverage(state: StateManager, cfg: Dict[str, Any], tf: str) -
                     continue
         if updated > 0:
             state.set(flag_key, int(time.time()))
-            logger.info(f"[retro_reindex] timeframe={tf} coverage entries updated={updated}")
+            logger.info(f"[retro_reindex] timeframe={tf.upper()} coverage entries updated={updated}")
         else:
             state.set(flag_key, int(time.time()))  # still set to avoid repeated scans
     except Exception as e:  # defensive
-        logger.warning(f"retro coverage reindex failed tf={tf}: {e}")
+        logger.warning(f"retro coverage reindex failed tf={tf.upper()}: {e}")
 
 def _bars_per_day(tf: str) -> int:
     return {
@@ -313,14 +325,12 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
     target_days = int(panel_target_days.get(tf, 0))
     target_bars = max(min_bars_floor, target_days * _bars_per_day(tf) if target_days else min_bars_floor)
     try:
-        keys = state.r.hkeys('harvest:coverage') or []  # type: ignore[assignment]
+        keys = state.hkeys_sync('harvest:coverage')
     except Exception:
         return False, {"error": "coverage_hash_unavailable"}
     covered: Dict[str, dict] = {}
     for k in keys:
         try:
-            if isinstance(k, bytes):
-                k = k.decode('utf-8')
             parts = str(k).split(':', 2)
             if len(parts) != 3:
                 continue
@@ -377,6 +387,15 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
     except Exception:
         pass
     elig = [c for c, m in covered.items() if (m.get('coverage', 0) >= min_cov and (m.get('actual_total', m.get('actual', 0)) or 0) >= target_bars)]
+    
+    # NEW: Quorum check - pass if at least 75% of symbols meet the bar target
+    quorum_pct = 0.75
+    if len(covered) >= min_sym:
+        qualified_count = sum(1 for m in covered.values() if (m.get('actual_total', m.get('actual', 0)) or 0) >= target_bars)
+        if (qualified_count / len(covered)) >= quorum_pct:
+            logger.info(f"Coverage gate passed by quorum: {qualified_count}/{len(covered)} ({quorum_pct:.0%}) met target bars.")
+            return True, {"eligible_quorum": qualified_count, "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered), "target_bars": target_bars}
+
     ok = len(elig) >= min_sym
     # Telemetry snapshot
     try:
@@ -396,7 +415,7 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
             state.set(f'coverage:panel:{tf}', panel_meta)
             logger.info(f"[panel_coverage] {panel_meta}")
             if panel_meta['bars_min'] < target_bars * 0.5:
-                logger.warning(f"panel underfilled tf={tf} bars_min={panel_meta['bars_min']} < 0.5*target ({target_bars})")
+                logger.warning(f"panel underfilled tf={tf.upper()} bars_min={panel_meta['bars_min']} < 0.5*target ({target_bars})")
     except Exception:
         pass
     return ok, {"eligible": len(elig), "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered), "target_bars": target_bars}
@@ -424,18 +443,44 @@ def loop() -> None:
     - No live trading side‑effects (execution handler stays in paper mode).
     """
     load_dotenv()
-    cfg = load_config()
-    random.seed(cfg["system"].get("seed", 1337))
-    configure_resolver(cfg.get("registry"))
 
+    # Configure logger early to catch config errors
     Path("logs").mkdir(exist_ok=True, parents=True)
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    )
+
+    try:
+        cfg = load_config()
+    except SystemExit:
+        logger.error("Exiting due to configuration error. Please check the logs above.")
+        return
+
+    # Reconfigure logger with level from config
+    logger.remove()
     logger.add(
         "logs/system.log",
-        level=cfg["system"]["log_level"],
+        level=cfg["system"]["log_level"].upper(),
         rotation="10 MB",
         retention="14 days",
         enqueue=True,
+        format="{time} {level} {message}",
     )
+    logger.add(
+        sys.stderr,
+        level=cfg["system"]["log_level"].upper(),
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    )
+
+    # NEW: Set specific logger level for v26meme.research.generator
+    logger.level("v26meme.research.generator", level="DEBUG")
+
+    random.seed(cfg["system"].get("seed", 1337))
+    configure_resolver(cfg.get("registry"))
+
     logger.info("🚀 v26meme v4.7.5 loop starting…")
 
     if ((cfg.get("llm") or {}).get("provider", "").lower() != "openai" or not os.getenv("OPENAI_API_KEY", "")):
@@ -446,53 +491,29 @@ def loop() -> None:
 
     lakehouse = _make_lakehouse(cfg)
     screener = UniverseScreener(cfg["data_source"]["exchanges"], cfg["screener"], cfg.get("feeds"))
-    store = ScreenerStore(cfg["screener"].get("snapshot_dir", "data/screener_snapshots"), state)
-    feature_factory = FeatureFactory()
+    snapshot_dir = cfg["screener"].get("snapshot_dir") or "data/screener_snapshots"
+    store = ScreenerStore(snapshot_dir, state)
     catalog = CatalogManager(state, cfg.get("registry"))
-
-    slip_table = state.get("slippage:table") or {}
-    try:
-        simlab = SimLab(
-            cfg["execution"]["paper_fees_bps"],
-            cfg["execution"]["paper_slippage_bps"],
-            slippage_table=slip_table,
-        )
-    except TypeError:  # backward compat
-        simlab = SimLab(
-            cfg["execution"]["paper_fees_bps"],
-            cfg["execution"]["paper_slippage_bps"],
-        )
-
-    base_features = [
-        "return_1p",
-        "volatility_20p",
-        "momentum_10p",
-        "rsi_14",
-        "close_vs_sma50",
-        "hod_sin",
-        "hod_cos",
-        "round_proximity",
-        "btc_corr_20p",
-        "eth_btc_ratio",
-    ]
-    generator = GeneticGenerator(
-        base_features,
-        cfg["discovery"]["population_size"],
-        seed=cfg["system"].get("seed", 1337),
-    )
-    prober = FeatureProber(
-        cfg["execution"]["paper_fees_bps"],
-        cfg["execution"]["paper_slippage_bps"],
-        perturbations=cfg["prober"].get("perturbations", 64),
-        delta_fraction=cfg["prober"].get("delta_fraction", 0.15),
-        seed=cfg["system"].get("seed", 1337),
-    )
-    optimizer = PortfolioOptimizer(cfg)
+    optimizer = PortfolioOptimizer(cfg.get("portfolio", {}))
     lane_mgr = LaneAllocationManager(cfg, state)
     exchange_factory = ExchangeFactory(os.environ.get("GCP_PROJECT_ID"))
-    risk = RiskManager(state, cfg)
+    risk = RiskManager(state, cfg, lakehouse=lakehouse)
     exec_handler = ExecutionHandler(state, exchange_factory, cfg, risk_manager=risk)
-    proposer = LLMProposer(state)
+    ensemble_manager = EnsembleManager(state, cfg, lakehouse=lakehouse)
+
+    def _get_current_gate_stage(state: StateManager, cfg: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Gets the current promotion gate stage and its config."""
+        stages = cfg.get("discovery", {}).get("gate_stages", [])
+        if not stages:
+            # Fallback to top-level if not defined
+            return "default", cfg.get("discovery", {}).get("promotion_criteria", {})
+        
+        current_stage_name = state.get("gate:stage:current") or stages[0]["name"]
+        for stage in stages:
+            if stage["name"] == current_stage_name:
+                return current_stage_name, stage
+        # Fallback to the first stage if the stored one is not found
+        return stages[0]["name"], stages[0]
 
     def _research_tf() -> str:
         tf_opts = (cfg.get("harvester") or {}).get("timeframes_by_lane", {}).get("core") or ["1h"]
@@ -509,334 +530,175 @@ def loop() -> None:
                     logger.info(f"[hygiene] {json.dumps(hg)}")
             except Exception as _e:
                 logger.warning(f"Hygiene error: {_e}")
-            catalog.maybe_refresh(
-                screener.exchanges,
-                include_derivatives=cfg["screener"].get("derivatives_enabled", False),
-            )
-            # Harvest latest OHLCV (partial mode if enabled)
+            
+            catalog.maybe_refresh(screener.exchanges)
+            if state.get("screener:force_refresh"):
+                state.r.delete("screener:force_refresh")
+
+            # 1. Data Harvesting
+            # --------------------------------------------------------------------------
+            logger.info("STEP 1/6: Starting data harvesting...")
             try:
-                harvest_once(cfg, state, partial_mode=cfg.get('harvester', {}).get('partial_harvest', False))  # type: ignore[arg-type]
-            except TypeError:
-                # backward compatibility with earlier signature
-                harvest_once(cfg, state)  # type: ignore[misc]
-            except Exception as e:  # fail closed but keep loop alive
-                logger.opt(exception=True).error(f"harvest cycle error: {e}")
-                risk.note_error()
-
-            # Coverage gate (skip research work until minimal panel viable)
-            tf_gate = _research_tf()
-            gate_ok, gate_stats = _coverage_gate_ok(state, cfg, tf_gate)
-            if not gate_ok:
-                logger.info(f"Coverage gate pending tf={gate_stats.get('tf')} eligible={gate_stats.get('eligible')}/{gate_stats.get('required')} min_cov={gate_stats.get('min_cov')}")
-                time.sleep(cfg["system"]["loop_interval_seconds"])
-                continue
-
-            instruments, tickers_by_venue = screener.get_active_universe()
-            if not instruments:
-                logger.warning("No instruments from screener; sleeping.")
-                time.sleep(cfg["system"]["loop_interval_seconds"])
-                continue
-
-            # Save screener snapshot + publish latest symbols & compute top gainers
-            store.save(instruments, tickers_by_venue)
-            moonshot_bases = compute_top_gainers_bases(tickers_by_venue, top_n=10)
-            state.set("lane:moonshot:gainers", list(moonshot_bases))
-
-            # Adaptive knobs (vol‑scaled daily stop)
-            tf = _research_tf()
-            btc_df = _lh_get_data(lakehouse, cfg, "BTC_USD_SPOT", tf)
-            publish_adaptive_knobs(state, cfg, btc_df)
-
-            adapt_pop = state.get("adaptive:population_size")
-            if adapt_pop:
-                generator.population_size = int(adapt_pop)
-
-            lh_syms = set(_lh_get_available_symbols(lakehouse, cfg, tf))
-            tradeable: List[Tuple[Dict[str, Any], str]] = []
-            for inst in instruments:
-                canon = inst.get("display")
-                if canon in lh_syms:
-                    tradeable.append((inst, canon))
-            if not tradeable:
-                logger.warning("No tradeable symbols intersect lakehouse; sleeping.")
-                time.sleep(cfg["system"]["loop_interval_seconds"])
-                continue
-            logger.info(f"Tradeable: {[c for _, c in tradeable]}")
-
-            if not generator.population:
-                generator.initialize_population()
-            # Population pruning (memory / search pressure control)
-            try:
-                max_pop = int(cfg.get('discovery', {}).get('max_population_size', 1000))
-                if len(generator.population) > max_pop:
-                    generator.population = generator.population[:max_pop]
-            except Exception:
-                pass
-
-            # Ingest EIL survivors (budget)
-            if cfg.get("eil", {}).get("enabled", True):
-                scan_count = int(cfg.get('eil', {}).get('scan_batch_size', 200))
-                keys = [k for k in state.r.scan_iter(match="eil:candidates:*", count=scan_count)]
-                keys = keys[: int(cfg["eil"].get("survivor_top_k", 25))]
-                for k in keys:
-                    cand = state.get(k)
-                    if cand and cand.get("formula"):
-                        generator.population.append(cand["formula"])
-                for k in keys:
-                    state.r.delete(k)
-
-            # LLM suggestions (OpenAI-only)
-            if cfg.get("llm", {}).get("enable", True):
-                k = int(cfg["llm"].get("max_suggestions_per_cycle", 3))
-                for f in proposer.propose(base_features, k=k):
-                    if f not in generator.population:
-                        generator.population.append(f)
-
-            # Build panel cache
-            eth_df = _lh_get_data(lakehouse, cfg, "ETH_USD_SPOT", tf)
-            df_cache: Dict[str, pd.DataFrame] = {}
-            bases = list({canon.split('_')[0] for _, canon in tradeable})
-            if not bases:
-                logger.warning("No bases extracted from tradeable list; sleeping.")
-                time.sleep(cfg["system"]["loop_interval_seconds"])
-                continue
-            k_bases = min(max(1, int(cfg["discovery"]["panel_symbols"])), len(bases))
-            chosen_bases = random.sample(bases, k_bases)
-            for base in chosen_bases:
-                canon = f"{base}_USD_SPOT"
-                df = _lh_get_data(lakehouse, cfg, canon, tf)
-                if df.empty:
-                    continue
-                df_feat = feature_factory.create(
-                    df,
-                    symbol=canon,
-                    cfg=cfg,
-                    other_dfs={"BTC_USD_SPOT": btc_df, "ETH_USD_SPOT": eth_df},
-                )
-                for f in base_features:
-                    if f in df_feat.columns:
-                        lookback = cfg.get('features', {}).get('zscore_lookback', 200)
-                        df_feat[f] = lagged_zscore(df_feat[f], lookback=lookback, cfg=cfg)
-                df_feat = df_feat.dropna()
-                df_feat.attrs["display"] = canon
-                df_cache[canon] = df_feat
-
-            # Fitness via panel CV stats
-            cv_method = str(cfg["discovery"].get("cv_method", "kfold")).lower()
-            pvals_by_fid: Dict[str, float] = {}
-            fitness: Dict[str, float] = {}
-            for formula in list(generator.population):  # snapshot
-                fid = hashlib.sha256(json.dumps(formula).encode()).hexdigest()
-                panel_returns: Dict[str, pd.Series] = {}
-                for base in chosen_bases:
-                    canon = f"{base}_USD_SPOT"
-                    dff = df_cache.get(canon)
-                    if dff is None or dff.empty:
-                        continue
-                    stats = simlab.run_backtest(dff, formula)
-                    overall = stats.get("all", {})
-                    if overall and overall.get("n_trades", 0) > 0:
-                        panel_returns[canon] = pd.Series(overall.get("returns", []), dtype=float)
-                if not panel_returns:
-                    fitness[fid] = 0.0
-                    continue
-                cv = panel_cv_stats(
-                    panel_returns,
-                    k_folds=cfg["discovery"]["cv_folds"],
-                    embargo=cfg["discovery"]["cv_embargo_bars"],
-                    alpha_fdr=cfg["discovery"]["fdr_alpha"],
-                    cv_method=cv_method,
-                )
-                fitness[fid] = float(cv.get("mean_oos", 0.0))
-                pvals_by_fid[fid] = float(cv.get("p_value", 1.0))
-
-            # Evolve population using available fitness scores
-            generator.run_evolution_cycle(fitness)
-
-            # Promotion pass: BH-FDR + hard gates + factor-aware penalty
-            rep_canon = next(iter(df_cache.keys()), None)
-            promoted_candidates: List[Dict[str, Any]] = []
-            if rep_canon:
-                # Build p-value pairs from stored stats when available
-                pairs = []
-                for fid, pv in pvals_by_fid.items():
-                    # allow external stats override
-                    stats = state.get(f"alpha:stats:{fid}") or {}
-                    real_p = stats.get('p_value')
-                    if real_p is not None:
-                        pv = float(real_p)
-                    pairs.append((fid, float(pv)))
-                if pairs:
-                    pvals = [p for _, p in pairs]
-                    kept_mask, _ = benjamini_hochberg(pvals, cfg["discovery"]["fdr_alpha"])
-                    keep_fids = {fid for (fid, _), keep in zip(pairs, kept_mask) if keep}
-                else:
-                    keep_fids = set()
-                prom: List[Dict[str, Any]] = []
-                df_rep = df_cache.get(rep_canon)
-                for formula in generator.population:
-                    fid = hashlib.sha256(json.dumps(formula).encode()).hexdigest()
-                    if fid not in keep_fids or df_rep is None:
-                        continue
-                    stats_rep = simlab.run_backtest(df_rep, formula)
-                    overall = stats_rep.get("all", {})
-                    if not overall or overall.get("n_trades", 0) == 0:
-                        continue
-                    pv = pvals_by_fid.get(fid, 1.0)
-
-                    # factor penalty vs current active alphas
-                    active = state.get_active_alphas()
-                    corr_pen = 0.0
-                    if active:
-                        cand = np.array(overall.get("returns", []), dtype=float)
-                        for a in active:
-                            ar = np.array((a.get("performance", {}).get("all", {}).get("returns", [])), dtype=float)
-                            if len(ar) > 5 and len(cand) > 5:
-                                m = min(len(ar), len(cand))
-                                c = np.corrcoef(ar[-m:], cand[-m:])[0, 1]
-                                if np.isfinite(c):
-                                    corr_pen = max(corr_pen, abs(float(c)))
-                    if corr_pen >= cfg["discovery"]["factor_correlation_max"]:
-                        pv = min(1.0, pv + 0.4)  # penalize crowding
-                    prom.append({"fid": fid, "formula": formula, "p": pv, "overall": overall})
-                if prom:
-                    pvals = [c["p"] for c in prom]
-                    kept_mask, _ = benjamini_hochberg(pvals, cfg["discovery"]["fdr_alpha"])
-                    promoted_candidates = [c for c, keep in zip(prom, kept_mask) if keep]
-
-            # Promotion Gate 2: Hard gates + prober + lane tag
-            budget_left = cfg["discovery"]["max_promotions_per_cycle"]
-            gate = cfg["discovery"]["promotion_criteria"]
-            min_rob = float(cfg["prober"].get("min_robust_score", 0.55))
-            moon_base_set = set(state.get("lane:moonshot:gainers") or [])
-            dsr_cfg = (cfg.get("validation") or {}).get("dsr", {})
-            # Rejection counters (1):
-            rej = {"dsr":0, "min_trades":0, "hard_gates":0, "factor_corr":0, "robust":0}
-            daily_key = f"promotions:day:{datetime.now(timezone.utc).strftime('%Y%m%d')}"
-            used_today = int(state.get(daily_key) or 0)
-            daily_cap = int(cfg['discovery'].get('max_promotions_per_day', 0))
-            if used_today >= daily_cap:
-                logger.info(f"Daily promotion cap reached ({used_today}/{daily_cap})")
-                promoted_candidates = []
-            # Risk freeze (E): if conserve_mode active or halted, block promotions
-            if state.get('risk:halted') or state.get('risk:conserve_active'):
-                if promoted_candidates:
-                    logger.info("Promotion freeze active (risk conserve/halt)")
-                promoted_candidates = []
-            for c in sorted(promoted_candidates, key=lambda x: x["overall"]["sortino"], reverse=True):
-                if budget_left <= 0:
-                    break
-                if used_today >= daily_cap:
-                    break
-                ov = c["overall"]
-                fid = c["fid"]
-                if dsr_cfg.get("enabled"):
-                    n_trials = max(1, len(generator.population))
-                    dsr_prob = deflated_sharpe_ratio(pd.Series(ov.get("returns", []), dtype=float), n_trials=n_trials, sr_benchmark=float(dsr_cfg.get("benchmark_sr", 0.0)))
-                    if dsr_prob < float(dsr_cfg.get("min_prob", 0.60)):
-                        rej['dsr'] += 1; continue
-                buf = float(cfg.get('discovery', {}).get('promotion_buffer_multiplier', 1.0))
-                if ov.get("n_trades", 0) < gate["min_trades"]:
-                    rej['min_trades'] += 1; continue
-                if not (ov.get("sortino", 0) >= gate["min_sortino"] * buf and ov.get("sharpe", 0) >= gate["min_sharpe"] * buf and ov.get("win_rate", 0) >= gate.get("min_win_rate", 0) and ov.get("mdd", 0) <= gate.get("max_mdd", 1.0)):
-                    rej['hard_gates'] += 1; continue
-                rob_score = 0.0
-                if cfg.get("prober", {}).get("enabled", True):
-                    if rep_canon and df_cache.get(rep_canon) is not None:
-                        probe_res = prober.score(df_cache[rep_canon], c["formula"])
-                        rob_score = float(probe_res.get("robust_score", 0.0))
-                if rob_score < min_rob:
-                    rej['robust'] += 1; continue
-                # Factor correlation penalty already applied via pv earlier; enforce hard cap
-                active = state.get_active_alphas()
-                crowd = False
-                if active:
-                    cand = np.array(ov.get("returns", []), dtype=float)
-                    for a in active:
-                        ar = np.array((a.get("performance", {}).get("all", {}).get("returns", [])), dtype=float)
-                        if len(ar) > 5 and len(cand) > 5:
-                            m = min(len(ar), len(cand))
-                            cval = np.corrcoef(ar[-m:], cand[-m:])[0, 1]
-                            if np.isfinite(cval) and abs(float(cval)) >= cfg["discovery"]["factor_correlation_max"]:
-                                crowd = True; break
-                if crowd:
-                    rej['factor_corr'] += 1; continue
-                alpha_id = c["fid"]
-                alpha = Alpha(
-                    id=alpha_id,
-                    name=alpha_id[:8],
-                    formula=c["formula"],
-                    universe=[rep_canon] if rep_canon else [],
-                    timeframe=_research_tf(),
-                    lane="moonshot" if (rep_canon.split("_")[0] if rep_canon else "") in moon_base_set else "core",
-                    performance={"all": ov},
-                )
-                # Atomic-ish update with dedupe safeguard
-                actives = state.get_active_alphas(); actives.append(alpha.model_dump())
-                seen_ids: set[str] = set(); deduped: list[dict[str, Any]] = []
-                for _a in actives:
-                    aid = _a.get('id')
-                    if not aid or aid in seen_ids: continue
-                    seen_ids.add(aid); deduped.append(_a)
-                state.set_active_alphas(deduped)
-                # Flag for coverage threshold escalation after first promotion
-                if not state.get('coverage:raise_threshold'):
-                    state.set('coverage:raise_threshold', 1)
-                budget_left -= 1; used_today += 1
-                state.set(daily_key, used_today)
-                logger.success(
-                    f"PROMOTED {alpha.id[:8]} lane={alpha.lane} rob={rob_score:.2f} sharpe={ov.get('sharpe',0):.2f} trades={ov.get('n_trades')} (used_today={used_today}/{daily_cap})"
-                )
-            if rej:
-                logger.info(f"Promotion rejections breakdown {rej} (remaining_daily={daily_cap-used_today})")
-            # Snapshot active alphas registry (audit) (3)
-            try:
-                snap_dir = Path('data/alphas'); snap_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-                import json as _json
-                with open(snap_dir / f'registry_{ts}.json','w') as f:
-                    _json.dump(state.get_active_alphas(), f)
-            except Exception:
-                logger.warning("Could not write alpha registry snapshot")
-
-            # Auto-switch to CPCV if configured (7)
-            try:
-                if cfg['discovery'].get('auto_cpcv'):
-                    if (cfg['discovery']['cv_method'] == 'kfold' and (len(df_cache) >= 8 or cfg['discovery']['population_size'] >= 300)):
-                        cfg['discovery']['cv_method'] = 'cpcv'
-                        logger.info("Auto-switched CV method to CPCV for robustness")
-            except Exception:
-                pass
-
-            try:
-                active_alphas = state.get_active_alphas()
-                if active_alphas:
-                    raw_weights = optimizer.get_weights(active_alphas, 'all')
-                    if raw_weights:
-                        # Lane snapshot
-                        try:
-                            lane_snapshot = {a['id'][:8]: a.get('lane','core') for a in active_alphas}
-                            logger.info(f"Lane snapshot active={len(active_alphas)} lanes={lane_snapshot}")
-                        except Exception:
-                            pass
-                        lane_weights = lane_mgr.apply_lane_budgets(raw_weights, active_alphas)
-                        state.set('portfolio:alpha_weights', lane_weights)
-                        exec_handler.reconcile(lane_weights, active_alphas)
-                        logger.info(f"Reconciled portfolio with {len(lane_weights)} alpha weights post-lane allocation")
-                    else:
-                        logger.info("No optimizer weights produced (insufficient performance data)")
-                else:
-                    logger.info("No active alphas to allocate this cycle")
+                harvest_once(cfg, state)
             except Exception as e:
-                logger.opt(exception=True).error(f"Allocation/reconcile error: {e}")
+                logger.error(f"Data harvesting failed: {e}")
+                time.sleep(cfg["system"]["loop_interval_seconds"])
+                continue
+            logger.info("Data harvesting complete.")
 
-        except KeyboardInterrupt:
-            logger.warning("Shutdown requested.")
+            # 2. Universe Screening
+            # --------------------------------------------------------------------------
+            logger.info("STEP 2/6: Starting universe screening...")
+            tf = _research_tf()
+            
+            # Coverage Gate
+            coverage_ok, coverage_stats = _coverage_gate_ok(state, cfg, tf)
+            if not coverage_ok:
+                logger.warning(f"Coverage gate NOT passed for tf={tf.upper()}. Stats: {coverage_stats}. Deferring research.")
+                time.sleep(cfg["system"]["loop_interval_seconds"])
+                continue
+            logger.info(f"Coverage gate passed for tf={tf.upper()}. Stats: {coverage_stats}")
+
+            # Screener Execution
+            try:
+                universe, tickers = screener.get_active_universe()
+                store.save(universe, tickers)
+                logger.info(f"Universe screening complete. Symbols: {len(universe)}")
+            except Exception as e:
+                logger.opt(exception=True).error(f"Universe screening failed: {e}")
+                time.sleep(cfg["system"]["loop_interval_seconds"])
+                continue
+
+            # 2.5. LLM-driven Seeding (Adaptive Injection)
+            # --------------------------------------------------------------------------
+            if cfg.get('llm', {}).get('enable', False):
+                logger.info("STEP 2.5/6: Starting LLM-driven strategy seeding...")
+                try:
+                    proposer = LLMProposer(state, cfg)
+                    seed_features = []
+                    seeded_with = "none"
+                    
+                    active_alpha_dicts = state.get_active_alphas() or []
+                    if active_alpha_dicts:
+                        base_features = set()
+                        sorted_alphas = sorted(active_alpha_dicts, key=lambda a: (a.get('performance', {}).get('all', {}).get('sortino', 0.0)), reverse=True)
+                        top_alphas = sorted_alphas[:max(1, len(sorted_alphas) // 10)]
+                        for alpha_dict in top_alphas:
+                            formula_raw = alpha_dict.get('formula_raw')
+                            if formula_raw:
+                                try:
+                                    formula_struct = json.loads(formula_raw)
+                                    base_features.update(_extract_features_from_formula(formula_struct))
+                                except Exception: continue
+                        if base_features:
+                            seed_features = list(base_features)
+                            seeded_with = "top_features"
+                            logger.info(f"Seeding LLM with top features: {seed_features}")
+                    
+                    if not seed_features:
+                        base_features_config = cfg.get('discovery', {}).get('base_features', [])
+                        if base_features_config:
+                            seed_features = random.sample(base_features_config, min(len(base_features_config), 15))
+                            seeded_with = "random_features"
+                            logger.info(f"Cold start: Seeding LLM with random base features: {seed_features}")
+                    
+                    if seed_features:
+                        k_proposals = cfg.get('llm', {}).get('max_suggestions_per_cycle', 10)
+                        proposals = proposer.propose(seed_features, k=k_proposals)
+                        state.set('llm:proposer:last_run', {'ts': time.time(), 'generated': len(proposals), 'seeded_with': seeded_with})
+                        logger.info(f"LLM proposer generated {len(proposals)} new formulas and pushed to 'llm:proposals' queue.")
+                    else:
+                        logger.info("No features to seed LLM, skipping proposal for this cycle.")
+                except Exception as e:
+                    logger.error(f"LLM Proposer failed: {e}", exc_info=True)
+
+            # 3. EIL - Alpha Discovery
+            # --------------------------------------------------------------------------
+            logger.info("STEP 3/6: Starting Extreme Iteration Layer (EIL) for alpha discovery...")
+            try:
+                # Get and record current gate stage config for observability
+                gate_stage_name, gate_config = _get_current_gate_stage(state, cfg)
+                state.set("eil:gate:current_config", json.dumps(gate_config))
+
+                logger.info("Invoking EIL function directly...")
+                survivors = run_eil(cfg)
+                
+                if survivors:
+                    logger.info(f"EIL returned {len(survivors)} survivors.")
+                    _promote_eil_survivors(state, cfg, survivors)
+                else:
+                    logger.info("EIL run completed with no new survivors.")
+
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during EIL execution: {e}", exc_info=True)
+
+
+            # 4. Snapshot active alphas registry
+            # --------------------------------------------------------------------------
+            logger.info("STEP 4/6: Snapshotting alpha registry...")
+            active_alpha_dicts = state.get_active_alphas()
+            active_alphas = [Alpha.model_validate(a) for a in active_alpha_dicts]
+            if active_alphas:
+                try:
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                    fn = f"data/alphas/registry_{ts}.json"
+                    with open(fn, "w") as f:
+                        json.dump(active_alpha_dicts, f, indent=2)
+                    logger.info(f"Snapshotted {len(active_alphas)} active alphas to {fn}")
+                except Exception as e:
+                    logger.error(f"Failed to snapshot alpha registry: {e}")
+
+            # 5. Ensemble Generation
+            # --------------------------------------------------------------------------
+            logger.info("STEP 5/6: Running ensemble manager...")
+            try:
+                ensemble_manager.run(active_alphas, exec_handler.get_portfolio()['equity'])
+            except Exception as e:
+                logger.error(f"Ensemble manager failed: {e}")
+
+            # 6. Portfolio Allocation & Execution
+            # --------------------------------------------------------------------------
+            logger.info("STEP 6/6: Starting portfolio allocation and execution...")
+            if not active_alphas:
+                logger.warning("No active alphas to allocate. Skipping.")
+            else:
+                try:
+                    # Publish risk metrics for dashboard observability
+                    current_equity = exec_handler.get_portfolio()['equity']
+                    risk.publish_risk_metrics(current_equity)
+
+                    regime = "all" # Or some logic to determine regime
+                    weights = optimizer.get_weights(active_alphas, regime)
+                    
+                    # Lane Management
+                    final_weights = lane_mgr.apply_lane_budgets(weights, active_alphas)
+                    logger.info(f"Final weights after lane management: {final_weights}")
+
+                    # Execution
+                    exec_handler.reconcile(final_weights, active_alphas)
+
+                except Exception as e:
+                    logger.error(f"Portfolio allocation/execution failed: {e}", exc_info=True)
+
+            # Publish adaptive knobs
+            try:
+                # Load BTC 1h data to drive adaptive stops
+                btc_df = _lh_get_data(lakehouse, cfg, "BTC_USD_SPOT", "1h")
+                publish_adaptive_knobs(state, cfg, btc_df)
+            except Exception as e:
+                logger.error(f"Failed to publish adaptive knobs: {e}")
+
+            logger.info(f"Cycle complete. Sleeping for {cfg['system']['loop_interval_seconds']}s.")
+            time.sleep(cfg["system"]["loop_interval_seconds"])
+
+        except (KeyboardInterrupt, SystemExit) as e:
+            logger.warning(f"Shutdown requested via {type(e).__name__}.")
             break
-        except Exception as e:  # fail-closed with backoff
-            logger.opt(exception=True).error(f"Loop error: {e}")
-            risk.note_error()
-            time.sleep(cfg["system"]["loop_interval_seconds"] * 2)
+        except Exception as e:
+            logger.opt(exception=True).error(f"Unhandled error in main loop: {e}")
+            time.sleep(cfg["system"]["loop_interval_seconds"])
+
+    logger.info("v26meme loop terminated.")
 
 # --------------------------------------------------------------------------------------
 # Debug Screener
@@ -861,9 +723,11 @@ def debug_screener() -> None:
     logger.info("🚀 v26meme v4.7.5 debug_screener starting…")
 
     screener = UniverseScreener(cfg["data_source"]["exchanges"], cfg["screener"], cfg.get("feeds"))
-    instruments, tickers_by_venue = screener.get_active_universe()
+    instruments, tickers_by_venue = screener.get_active_universe(debug=True)
     print("Instruments:", instruments)
     print("Tickers by venue:", list(tickers_by_venue.keys()))
+
+cli.add_command(debug_screener)
 
 @click.command()
 @click.option('--enforce', is_flag=True, help='Temporarily enforce current promotion gates during hygiene pass regardless of config flag.')
@@ -885,5 +749,98 @@ def hygiene_once(enforce: bool = False) -> None:
 
 cli.add_command(hygiene_once)
 
-if __name__ == "__main__":  # pragma: no cover
-    cli()
+def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any]) -> int:
+    """Promote top-k EIL survivors to the active alpha registry if they pass gates.
+
+    PIT note: Operates on historical performance of candidates from EIL. No lookahead.
+    """
+    survivors = state.get('eil:survivors:last_cycle') or []
+    if not survivors:
+        return 0
+
+    promoted_count = 0
+    promotions_today = len(state.get(_today_key("promotions")) or [])
+    max_promotions_day = int(cfg['discovery'].get('max_promotions_per_day', 1))
+    max_promotions_cycle = int(cfg['discovery'].get('max_promotions_per_cycle', 1))
+
+    if promotions_today >= max_promotions_day:
+        return 0
+
+    active_alphas = state.get_active_alphas() or []
+    active_formulas = {a.get('formula_raw') for a in active_alphas}
+
+    # Normalize and then sort
+    try:
+        # Convert flat survivor dicts to Alpha objects for consistent interface
+        candidate_alphas = [Alpha.model_validate(normalize_survivor_to_alpha(s)) for s in survivors]
+        
+        # Sort using the object's method
+        sorted_candidates = sorted(
+            candidate_alphas,
+            key=lambda a: a.sortino(),
+            reverse=True
+        )
+    except Exception as e:
+        logger.error(f"EIL_PROMOTION_SORT_FAIL: {e}")
+        # Fallback for safety
+        sorted_candidates = sorted(survivors, key=lambda s: s.get('sortino', s.get('sharpe', 0.0)), reverse=True)
+        # If fallback is used, we need to normalize inside the loop
+        sorted_candidates = [Alpha.model_validate(normalize_survivor_to_alpha(s)) for s in sorted_candidates]
+
+
+    for alpha in sorted_candidates:
+        if promoted_count >= max_promotions_cycle:
+            break
+        if promotions_today >= max_promotions_day:
+            break
+
+        if alpha.formula_raw in active_formulas:
+            continue
+
+        # Re-validate against promotion criteria as a final check
+        crit = cfg['discovery'].get('promotion_criteria', {})
+        if alpha.trades() < crit.get('min_trades', 20):
+            continue
+
+        active_alphas.append(alpha.model_dump())
+        active_formulas.add(alpha.formula_raw)
+        promoted_count += 1
+        promotions_today += 1
+        
+        state.r.rpush(_today_key("promotions"), alpha.id)
+        logger.success(f"EIL_PROMOTE_SUCCESS id={alpha.id} trades={alpha.trades()} sharpe={alpha.sharpe():.2f} sortino={alpha.sortino():.2f}")
+
+    if promoted_count > 0:
+        state.set_active_alphas(active_alphas)
+        
+    return promoted_count
+
+def _sync_and_run_screener(cfg: Dict[str, Any], state: StateManager) -> Tuple[List[str], bool]:
+    """Synchronously run the screener and return the resulting instruments.
+
+    This function ensures that the screener is executed with the latest data and
+    configuration, and it waits for the screener task to complete.
+
+    Returns:
+        Tuple[List[str], bool]: A tuple containing the list of instrument IDs found
+        by the screener and a boolean indicating success or failure.
+    """
+    from v26meme.data.harvester import run_once as _run_once
+
+    try:
+        # Force a data harvest before running the screener
+        _run_once(cfg, state)
+        logger.info("Data harvest complete. Running screener...")
+        
+        # Run the screener
+        universe, tickers = UniverseScreener(cfg["data_source"]["exchanges"], cfg["screener"], cfg.get("feeds")).get_active_universe()
+        
+        # Save the screener results
+        snapshot_dir = cfg["screener"].get("snapshot_dir") or "data/screener_snapshots"
+        ScreenerStore(snapshot_dir, state).save(universe, tickers)
+        
+        logger.info(f"Screener run complete. Symbols found: {len(universe)}")
+        return list(universe), True
+    except Exception as e:
+        logger.error(f"Screener run failed: {e}")
+        return [], False
