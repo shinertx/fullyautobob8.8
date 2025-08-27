@@ -101,6 +101,10 @@ class FeatureFactory:
         # Combine features and handle potential NaNs
         panel = pd.concat(features_list).sort_index()
         
+        # Add cross-sectional features like beta
+        if feature_configs.get('market_beta_windows'):
+            panel = self._add_market_beta_features(panel, feature_configs['market_beta_windows'])
+
         # Lag all features to ensure they are available at the time of decision making.
         feature_cols = [col for col in panel.columns if col not in ['open', 'high', 'low', 'close', 'volume']]
         
@@ -201,3 +205,49 @@ class FeatureFactory:
         df['round_proximity'] = -prox
         
         return df
+
+    def _add_market_beta_features(self, panel: pd.DataFrame, windows: List[int]) -> pd.DataFrame:
+        """
+        Calculates rolling beta against the panel's median return.
+        This is a cross-sectional feature and must be calculated after individual features.
+        """
+        if not windows or 'return_1p' not in panel.columns:
+            return panel
+
+        logger.debug(f"Adding market beta features with windows {windows}")
+
+        # Calculate market return (median return of all items at each timestamp)
+        # Use .groupby(level='timestamp') for MultiIndex or .groupby(df.index) for single index
+        market_return = panel.groupby(level='timestamp')['return_1p'].median()
+
+        # Align market return with the panel
+        panel['market_return'] = panel.index.get_level_values('timestamp').map(market_return)
+
+        # Calculate rolling beta for each item
+        for window in windows:
+            if window > 0:
+                # Using groupby on 'item' level to apply rolling calculation per item
+                rolling_cov = panel.groupby(level='item')[['return_1p', 'market_return']].rolling(window=window).cov()
+                
+                # The result of .cov() is a multi-indexed Series. We need to unstack it.
+                rolling_cov = rolling_cov.unstack(level=-1)
+                
+                # Extract covariance of asset with market and variance of market
+                cov_asset_market = rolling_cov[('return_1p', 'market_return')]
+                var_market = rolling_cov[('market_return', 'market_return')]
+                
+                # Beta calculation, handle division by zero
+                beta = cov_asset_market / var_market
+                
+                # The result 'beta' is a Series with a multi-index (item, timestamp).
+                # We need to align it back to the panel.
+                # First, remove the extra level from the rolling cov index
+                beta.index = beta.index.droplevel(-1)
+                
+                # Assign to a new column in the panel
+                panel[f'beta_{window}'] = beta
+
+        # Clean up the intermediate market_return column
+        panel.drop(columns=['market_return'], inplace=True)
+        
+        return panel

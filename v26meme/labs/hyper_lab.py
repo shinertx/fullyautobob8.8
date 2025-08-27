@@ -108,7 +108,8 @@ def _select_timeframe(cfg: dict, lake: Lakehouse, min_bars: int, min_panel: int,
         if not avail:
             continue
         # NEW: optional single-symbol narrowing (consistent with main loop gating)
-        avail = _maybe_restrict_single_symbol(cfg, avail)
+        # avail = _maybe_restrict_single_symbol(cfg, avail)
+        logger.info("Skipping single-symbol restriction for full panel operation.")
         cur_bars = {s: len(lake.get_data(s, tf)) for s in avail}
         cur_eligible = [s for s, n in cur_bars.items() if n >= min_bars]
         if len(cur_eligible) >= min_panel:

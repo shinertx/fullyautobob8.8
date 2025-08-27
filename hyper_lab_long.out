@@ -1,2 +1,0 @@
-nohup: ignoring input
-2025-08-21 15:38:41.313 | INFO     | v26meme.labs.hyper_lab:run_eil:131 - EIL_SINGLE_SYMBOL_MODE core_symbols=['BTC_USD_SPOT'] eligible_after_narrow=1
