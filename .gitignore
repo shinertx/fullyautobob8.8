@@ -48,3 +48,11 @@ logs/
 # Misc
 loop_err.log
 .env
+## v26meme curated ignore
+*.bak
+*corrupt*.bak
+*corrupted*.bak
+v26meme/data/universe_screener.py.new
+# local debug scripts
+test_crash.py
+tests/labs/debug_*.py
