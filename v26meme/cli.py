@@ -625,7 +625,8 @@ def loop() -> None:
                 
                 if survivors:
                     logger.info(f"EIL returned {len(survivors)} survivors.")
-                    _promote_eil_survivors(state, cfg, survivors)
+                    promoted_count = _promote_eil_survivors(state, cfg, survivors)
+                    logger.info(f"Promoted {promoted_count} new alphas from EIL survivors.")
                 else:
                     logger.info("EIL run completed with no new survivors.")
 
@@ -749,21 +750,21 @@ def hygiene_once(enforce: bool = False) -> None:
 
 cli.add_command(hygiene_once)
 
-def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any]) -> int:
+def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any], survivors: List[Dict[str, Any]]) -> int:
     """Promote top-k EIL survivors to the active alpha registry if they pass gates.
 
     PIT note: Operates on historical performance of candidates from EIL. No lookahead.
     """
-    survivors = state.get('eil:survivors:last_cycle') or []
     if not survivors:
         return 0
 
     promoted_count = 0
-    promotions_today = len(state.get(_today_key("promotions")) or [])
+    promotions_today_count = len(state.get(_today_key("promotions")) or [])
     max_promotions_day = int(cfg['discovery'].get('max_promotions_per_day', 1))
     max_promotions_cycle = int(cfg['discovery'].get('max_promotions_per_cycle', 1))
 
-    if promotions_today >= max_promotions_day:
+    if promotions_today_count >= max_promotions_day:
+        logger.warning(f"Daily promotion limit of {max_promotions_day} reached. No new promotions today.")
         return 0
 
     active_alphas = state.get_active_alphas() or []
@@ -790,8 +791,10 @@ def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any]) -> int:
 
     for alpha in sorted_candidates:
         if promoted_count >= max_promotions_cycle:
+            logger.info(f"Cycle promotion limit of {max_promotions_cycle} reached.")
             break
-        if promotions_today >= max_promotions_day:
+        if promotions_today_count >= max_promotions_day:
+            logger.warning(f"Daily promotion limit of {max_promotions_day} reached during cycle.")
             break
 
         if alpha.formula_raw in active_formulas:
@@ -805,7 +808,7 @@ def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any]) -> int:
         active_alphas.append(alpha.model_dump())
         active_formulas.add(alpha.formula_raw)
         promoted_count += 1
-        promotions_today += 1
+        promotions_today_count += 1
         
         state.r.rpush(_today_key("promotions"), alpha.id)
         logger.success(f"EIL_PROMOTE_SUCCESS id={alpha.id} trades={alpha.trades()} sharpe={alpha.sharpe():.2f} sortino={alpha.sortino():.2f}")
@@ -815,14 +818,14 @@ def _promote_eil_survivors(state: StateManager, cfg: Dict[str, Any]) -> int:
         
     return promoted_count
 
-def _sync_and_run_screener(cfg: Dict[str, Any], state: StateManager) -> Tuple[List[str], bool]:
+def _sync_and_run_screener(cfg: Dict[str, Any], state: StateManager) -> Tuple[List[Dict[str, Any]], bool]:
     """Synchronously run the screener and return the resulting instruments.
 
     This function ensures that the screener is executed with the latest data and
     configuration, and it waits for the screener task to complete.
 
     Returns:
-        Tuple[List[str], bool]: A tuple containing the list of instrument IDs found
+        Tuple[List[Dict[str, Any]], bool]: A tuple containing the list of instrument dicts found
         by the screener and a boolean indicating success or failure.
     """
     from v26meme.data.harvester import run_once as _run_once
