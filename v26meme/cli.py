@@ -12,6 +12,7 @@ from loguru import logger
 import pandas as pd
 import numpy as np
 import glob as _glob  # added for retro coverage reindex
+import redis
 
 from v26meme.core.state import StateManager
 from v26meme.core.config import RootConfig
@@ -522,7 +523,14 @@ def loop() -> None:
     if ((cfg.get("llm") or {}).get("provider", "").lower() != "openai" or not os.getenv("OPENAI_API_KEY", "")):
         logger.warning("LLM is OpenAI-only. Set llm.provider=openai and OPENAI_API_KEY in .env.")
 
-    state = StateManager(cfg["system"]["redis_host"], cfg["system"]["redis_port"])
+    host, port = cfg["system"]["redis_host"], cfg["system"]["redis_port"]
+    try:
+        state = StateManager(host, port)
+    except redis.exceptions.ConnectionError:
+        logger.critical(
+            f"FATAL: Redis unavailable at {host}:{port}. Start redis-server and retry."
+        )
+        raise SystemExit(1)
     
     # Check for persistent risk halt on startup
     if state.get("risk:halt"):
