@@ -23,7 +23,8 @@ class LLMProposer:
     def sanitize_formulas(base_features: List[str], suggestions: List[List[Any]],
                           suppressed: List[str] | None = None,
                           threshold_min: float = -5.0, threshold_max: float = 5.0,
-                          max_nodes: int = 31) -> List[List[Any]]:
+                          max_nodes: int = 31,
+                          feature_stats: Dict[str, Dict[str, float]] | None = None) -> List[List[Any]]:
         """Validate & clamp formulas.
 
         PIT: Pure transformation of already-produced suggestions.
@@ -35,30 +36,66 @@ class LLMProposer:
         seen_hashes = set()
         import json as _json, hashlib as _hashlib
 
+        def _normalize_op(op: str) -> str:
+            if not isinstance(op, str):
+                return ""
+            opu = op.strip().upper()
+            if opu in ("AND", "OR"):
+                return opu
+            if op.strip() in ('>', '<', '>=', '<=', '==', '!='):
+                return op.strip()
+            return ""
+
+        def _coerce_number(val: Any) -> float | None:
+            try:
+                if isinstance(val, (int, float)):
+                    return float(val)
+                if isinstance(val, str):
+                    return float(val.strip())
+            except Exception:
+                return None
+            return None
+
         def _valid(node) -> bool:
             if not isinstance(node, list):
                 return False
             # condition
-            if len(node) >=3 and isinstance(node[0], str) and node[1] in ('>','<'):
+            if len(node) >=3 and isinstance(node[0], str) and _normalize_op(node[1]) in ('>','<','>=','<=','==','!='):
                 if node[0] not in whitelist or node[0] in suppressed_set:
                     return False
-                try:
-                    float(node[2])
-                except Exception:
+                if _coerce_number(node[2]) is None:
                     return False
                 return True
-            if len(node) >=3 and isinstance(node[0], list) and isinstance(node[2], list) and node[1] in ('AND','OR'):
+            if len(node) >=3 and isinstance(node[0], list) and isinstance(node[2], list) and _normalize_op(node[1]) in ('AND','OR'):
                 return _valid(node[0]) and _valid(node[2])
             return False
 
         def _clamp(node):
-            if isinstance(node, list) and len(node)>=3 and isinstance(node[0], str) and node[1] in ('>','<'):
-                try:
-                    val = float(node[2])
-                    node[2] = max(threshold_min, min(threshold_max, val))
-                except Exception:
+            if isinstance(node, list) and len(node)>=3 and isinstance(node[0], str) and _normalize_op(node[1]) in ('>','<','>=','<=','==','!='):
+                feat = node[0]
+                num = _coerce_number(node[2])
+                if num is None:
                     node[2] = 0.0
+                    return
+                # Prefer empirical quantiles per feature if available
+                if feature_stats and isinstance(feature_stats.get(feat), dict):
+                    st = feature_stats.get(feat, {})
+                    lo = st.get('q10', st.get('min', threshold_min))
+                    hi = st.get('q90', st.get('max', threshold_max))
+                    try:
+                        lo = float(lo); hi = float(hi)
+                        if lo > hi:
+                            lo, hi = hi, lo
+                    except Exception:
+                        lo, hi = threshold_min, threshold_max
+                    node[1] = _normalize_op(node[1]) or '>'
+                    node[2] = min(max(num, lo), hi)
+                else:
+                    node[1] = _normalize_op(node[1]) or '>'
+                    node[2] = max(threshold_min, min(threshold_max, num))
             elif isinstance(node, list) and len(node)>=3:
+                if isinstance(node[1], str) and _normalize_op(node[1]) in ('AND','OR'):
+                    node[1] = _normalize_op(node[1])
                 if isinstance(node[0], list): _clamp(node[0])
                 if isinstance(node[2], list): _clamp(node[2])
 
@@ -152,8 +189,11 @@ class LLMProposer:
 
             cleaned: List[List[Any]] = []
             seen_hashes = set()
-            pipe = getattr(self.state,'r',None)
-            existing = set(pipe.smembers('llm:proposer:seen')) if pipe else set()
+            r = getattr(self.state,'r',None)
+            try:
+                existing = set(r.smembers('llm:proposer:seen')) if r else set()
+            except Exception:
+                existing = set()
 
             for f in suggestions:
                 step_detail = {"original_suggestion": f, "outcome": "REJECTED"}
@@ -168,7 +208,17 @@ class LLMProposer:
                     except Exception:
                         suppressed = []
 
-                sanitized = self.sanitize_formulas(base_features, [f], suppressed, threshold_min, threshold_max)
+                # Pull empirical feature stats when available to clamp thresholds to realistic ranges
+                feat_stats = {}
+                try:
+                    if getattr(self.state, 'get', None):
+                        raw_stats = self.state.get('eil:feature_stats') or {}
+                        if isinstance(raw_stats, dict):
+                            # raw_stats may include 'keep' flags per feature; pass-through is fine
+                            feat_stats = raw_stats
+                except Exception:
+                    feat_stats = {}
+                sanitized = self.sanitize_formulas(base_features, [f], suppressed, threshold_min, threshold_max, feature_stats=feat_stats)
                 if not sanitized:
                     step_detail["reason"] = "Sanitization failed"
                     step_detail["details"] = {"suppressed_features": suppressed}
@@ -195,17 +245,32 @@ class LLMProposer:
             run_details["metrics"]["accepted_count"] = len(cleaned)
             run_details["metrics"]["rejected_count"] = run_details["metrics"].get("initial_suggestion_count", 0) - len(cleaned)
 
-            if pipe:
+            if r:
                 if cleaned:
-                    pipe.incr("llm:proposer:success")
+                    try:
+                        r.incr("llm:proposer:success")
+                    except Exception:
+                        pass
                     for f in cleaned:
-                        pipe.rpush("llm:proposals", json.dumps(f, separators=(',',':')))
+                        try:
+                            r.rpush("llm:proposals", json.dumps(f, separators=(',',':')))
+                        except Exception:
+                            pass
                     if seen_hashes:
-                        pipe.sadd('llm:proposer:seen', *list(seen_hashes))
+                        try:
+                            r.sadd('llm:proposer:seen', *list(seen_hashes))
+                        except Exception:
+                            pass
                 rejected = len(suggestions) - len(cleaned)
-                if rejected>0: pipe.incrby("llm:proposer:rejected", rejected)
-                pipe.hincrby("llm:proposer:char_usage", "total_chars", len(txt))
-                pipe.execute()
+                if rejected>0:
+                    try:
+                        r.incrby("llm:proposer:rejected", rejected)
+                    except Exception:
+                        pass
+                try:
+                    r.hincrby("llm:proposer:char_usage", "total_chars", len(txt))
+                except Exception:
+                    pass
             return cleaned[:k]
         except requests.HTTPError as he:
             if getattr(self.state,'r',None):

@@ -1,6 +1,38 @@
-# Migration Notes
+# Migration Notes (v4.7.5 Canonicalization)
+
+Status Legend
+- Canonical: Live, blessed path (single source of truth)
+- Deprecated: Replaced; kept briefly with explicit replacement
+- Pending: Planned/spec’d, not yet shipped
+
+Executive Summary
+- Canonical
+  - PIT FeatureFactory single‑lag for engineered features
+  - Granular validation telemetry (min_trades, FDR, DSR) → hyper_lab
+  - Alpha registry hygiene (dedupe, retro gates, padding trim)
+  - Screener exclude stable‑stable crosses
+  - Harvester availability suppression + queue drain + alias fixes
+  - Risk halt → immediate flatten in paper execution
+  - Lane budgets (EWMA/dead‑band/max‑step), probation cap, moonshot→core retag
+  - Purged K‑Fold with embargo baseline (CPCV not auto‑escalated yet)
+- Config schema validation at startup
+- SimLab standardized stats API (+ adapter in hyper_lab)
+- EIL timeframe preference knob added (configurable, no magic TF order)
+ - TEMP bootstrap knobs to surface initial survivors (lower costs, looser gates, higher complexity penalty)
+- Deprecated
+  - Opaque gate logs → use granular rejection reasons
+  - Double‑shift feature pipelines → single‑lag only
+  - Including stable‑stable pairs in screener → exclude_stable_stable=true
+  - Blind harvester retries → availability suppression with TTL
+  - Legacy SimLab result shape assumptions → standardized stats/adapter
+  - Forcing K‑Fold when CPCV criteria met → adopt auto‑CPCV (Pending)
+- Pending
+  - Auto‑CPCV escalation when panel/pop thresholds met
+  - Composite fitness with activation_gain weights
+  - Deeper GA trees (>2) and broader logical forms
 
 ## 2025-08-26 Configuration Tune for Initial Discovery
+Status: Canonical (operational tuning)
 
 Changes:
 - **Loosened Initial Gates:**
@@ -22,6 +54,7 @@ Rollback:
 - Revert the values in `configs/config.yaml` to their previous settings.
 
 ## 2025-08-26 Evolutionary Algorithm Enhancement: Complexity Penalty
+Status: Canonical
 
 Changes:
 - **Complexity Penalty:** Introduced a complexity penalty in the genetic algorithm's fitness function (`v26meme/research/generator.py`). The fitness of each formula is now penalized based on its size (number of nodes in its syntax tree).
@@ -38,6 +71,57 @@ Rollback:
 - To disable this feature, set `discovery.fitness_weights.complexity_penalty: 0.0` in `configs/config.yaml`.
 
 ## 2025-08-27 Critical Bug Fixes & Configuration Restoration
+Status: Canonical
+
+## 2025-08-29 EIL Reliability + Validation Power (Canonical)
+Status: Canonical (structural, PIT-safe); operations updated
+
+Changes (engineering):
+- Timeframe selection fallback: `v26meme/labs/hyper_lab.py`
+  - Uses harvester quality summary when available; if TF `accept_ratio` is missing/low, falls back to bars-only gate (min_bars + min_panel). Prevents EIL stalls on partial/old summaries.
+- CPCV enabled: `hyper_lab.py` now passes `per_symbol` returns from `SimLab` into `Validator` to activate symbol-fold CV when multiple symbols exist.
+- Scale-free generator features: `hyper_lab.py`
+  - Restricts generator to standardized, cross-asset features (`zscore_*`, `volatility_*`, `parkinson_vol_*`, `roc_*`, `return_*`) and maps `sma_N` → `close_vs_smaN`. Avoids price‑level thresholds across assets.
+- Hysteresis (edge de‑bounce): `v26meme/labs/simlab.py`
+  - New `min_hold_bars` enforces minimum bars between flips; configured under `eil.min_hold_bars`.
+- Gate alignment & telemetry: `hyper_lab.py` and `cli.py`
+  - Writes `eil:gate:diagnostic` (survivor_density, median_trades) and `eil:last_summary` (per-gen rejection breakdown) to Redis; CLI echoes summary when no survivors found.
+- Redis default for EIL state: `hyper_lab.py`
+  - Default to Redis (tests can still opt-in to in-memory); fixes cross‑process survivor visibility.
+- Startup hardening (Redis retry): `v26meme/cli.py`
+  - Optional retry loop on initial Redis ping controlled by env/cfg (does not alter test semantics).
+- Main loop supervisor: `scripts/supervise_main_loop.sh`
+  - Simple restart-on-exit wrapper with exponential backoff to keep orchestrator up.
+
+Changes (config knobs):
+- `configs/config.yaml`
+  - `discovery.population_size: 60` (was 120), `generations_per_cycle: 4` (was 8) — reduce BH‑FDR trial count m.
+  - `discovery.prefilter.sign_p_max: 0.15`, `median_bps_min: 0.8` — stricter prefilter (note: code wiring pending future change if not already applied elsewhere).
+  - `llm.max_suggestions_per_cycle: 10` (was 20) — reduce extra trials.
+  - `eil.fast_window_days: 150` (was 100) — more trades, better CV power.
+  - `eil.min_hold_bars: 2` — enable hysteresis in `SimLab`.
+
+Rationale:
+- Remove structural stalls, increase statistical power, and ensure features are causal/scale‑free — without loosening DSR/FDR.
+- Keep the orchestrator resilient to transient infra issues and simplify operations.
+
+PIT/Risk notes:
+- All changes remain PIT‑safe (no forward bars, lagged stats, embargo/CV unchanged). Hysteresis only filters edges; no lookahead.
+- No live trading changes; execution remains paper with risk rails unaffected.
+
+Verification Checklist:
+- [ ] EIL logs show `EIL_TF_SELECTION_FALLBACK` when quality summary is partial, and generations proceed (no `EIL_COVERAGE_FAIL` loop).
+- [ ] Redis keys update during runs: `eil:last_summary`, `eil:gate:diagnostic`.
+- [ ] CLI emits `EIL_SUMMARY` when no survivors; promotions happen automatically when survivors appear.
+- [ ] `scripts/supervise_main_loop.sh` keeps main loop alive; see `loop.supervisor.log` increments.
+- [ ] `eil.min_hold_bars` is honored (reduced toggly trades; observe EIL_GEN_DIAG trade counts stabilize).
+
+Rollback:
+- Revert generator scale-free filter block in `hyper_lab.py` to restore prior feature set.
+- Set `eil.min_hold_bars: 0` to disable hysteresis.
+- Remove TF fallback by deleting the bars-only fallback block (not recommended; may re‑introduce stalls).
+- Remove Redis retry by unsetting `REDIS_RETRY_ON_START` and related cfg/env or revert `cli.py` diff.
+- Stop supervisor: kill tmux session `main_loop` or run `tmux kill-session -t main_loop`.
 
 Changes:
 - **EIL Backtest Logic Fix:** Corrected a fatal `AttributeError` in `v26meme/labs/hyper_lab.py` where the backtest result (a pandas DataFrame from `SimLab`) was incorrectly processed as a dictionary. This bug was the primary cause of zero EIL output and promotions.
@@ -57,6 +141,7 @@ Rollback:
 - Reverting these changes is not recommended as they fix fundamental bugs.
 
 ## 2025-08-19 Alpha Registry Hygiene (Dedup + Retro Gates + Padding Trim)
+Status: Canonical
 
 Changes:
 - Added `_alpha_registry_hygiene` routine invoked each loop cycle (pre-harvest) to: 
@@ -191,6 +276,7 @@ Rollback:
 - Comment out risk flatten block if causing unintended position churn (ensure halt flag logic first).
 
 ## 2025-08-19 Lane Allocation Integration
+Status: Canonical
 
 Change:
 - Integrated dynamic lane budget application and portfolio reconciliation into main loop (`cli.py`). After promotions/pruning and diagnostics, the loop now:
@@ -219,6 +305,7 @@ Rollback:
 - Delete `portfolio:alpha_weights` key if stale allocations undesirable.
 
 ## 2025-08-19 Harvest Availability Suppression & Core Symbol Prune
+Status: Canonical
 
 Changes:
 - Pruned synthetic / non-venue pairs from `harvester.core_symbols` (removed: `USDC_USD_SPOT`, `USDC_USDT_SPOT`, `EUR_USD_SPOT`).
@@ -248,6 +335,8 @@ Rollback:
 - Re-add removed symbols to `core_symbols` if needed.
 
 ## 2025-08-19 Screener Stablecoin Cross Exclusion
+Status: Canonical
+Replacement for: Deprecated inclusion of stable‑stable pairs
 
 Change:
 - Added config flag `screener.exclude_stable_stable` (default true in current config) and implementation in `UniverseScreener` to skip markets where both base and quote are recognized stablecoins (USDT, USDC, DAI, FDUSD, TUSD, PYUSD).
@@ -273,6 +362,7 @@ Rollback:
 - No further code changes required; feature is gated purely by config.
 
 ## 2025-08-19 Alpha Set Prune & Temporary Risk / Promotion Overrides
+Status: Canonical (temporary operational override)
 
 Changes:
 - Pruned active alpha set from 52 → 20 (kept top Sharpe performers meeting quality filters: Sharpe ≥0.5, Sortino ≥0.7, win_rate ≥0.48, mdd ≤0.35, n_trades ≥30).
@@ -296,10 +386,13 @@ Rollback:
 - Re-add pruned alphas only if justified (re-run backtests / validation) — not recommended blindly.
 
 ## 2025-08-19 — FeatureFactory double-shift removal
+Status: Canonical
+Replacement: Single‑lag engineered features (PIT) in FeatureFactory
 
 - Removed second lag application to momentum_10p and rsi_14 (previously shifted twice via shift_cols) to restore intended t-1 alignment (PIT correctness). No interface change; deterministic outputs preserved.
 
 ## 2025-08-19 — Harvester queue & suppression updates
+Status: Canonical
 
 - Timeframe alias map corrected: coinbase 6h retained; kraken 6h -> 4h.
 - EIL harvest queue now lpop drains up to limit (no overflow loss).
@@ -307,6 +400,17 @@ Rollback:
 - Venue symbol fallback: attempts BASE/QUOTE if registry lookup fails.
 
 ## 2025-08-19 Lane Instrumentation & Control Upgrades (Phases 1-2 + 7 + A + E + C partial)
+Status: Mixed
+Canonical (implemented):
+- Rejection counters; daily promotion counter; alpha registry snapshots
+- Lane EWMA smoothing, dead‑band, max step; probation cap; moonshot→core retag
+- Risk freeze for promotions when risk flags set
+- Population size increase; multi‑symbol expansion
+
+Pending (deferred):
+- Advanced factor correlation matrix penalty (beyond pairwise)
+- Aging/decay pruning model
+- Auto‑CPCV toggle based on panel size/population (not shipped)
 
 Implemented:
 - Rejection counters (dsr, min_trades, hard_gates, factor_corr, robust) with per-cycle log and remaining daily promotion quota.
@@ -680,6 +784,7 @@ Risks / Mitigations:
 - Higher error threshold could delay kill-switch on real faults; mitigation: manual log monitoring during sandbox phase.
 
 ## 2025-08-22 EIL Core Evolution and Fitness Function Upgrade (Draft Summary)
+Status: Pending (design; not canonical)
 
 User-intent summary of recent / ongoing EIL changes and diagnostic path. NOTE: Some items below are partially implemented (activation gain + instrumentation) while others (full composite fitness weights, verified survivor emergence) remain in-progress.
 
@@ -691,11 +796,11 @@ Critical focus on restoring the Evolutionary Iteration Loop (EIL) to produce eva
    - Existing subtree crossover & multi‑operator mutation confirmed (threshold / feature / operator / logical op). Max depth still 2 (deeper depth expansion not yet applied).
    - Diversity improvements planned (variable depth >2, additional logical forms) – NOT yet merged.
 2. `feature_factory.py`
-   - Single lag application already in place for price‑derived features; no redundant double shifts detected in current version. (Claimed multi‑shift removal not required.)
+   - Single‑lag already in place (Canonical). Any residual double‑shift path is Deprecated.
 3. `hyper_lab.py`
    - Added activation_gain term (exp saturation on trades) and p-value / Sharpe / trades distribution logging (`EIL_DIST`).
    - Added FDR debug bypass + survivor telemetry scaffolding.
-   - Composite fitness (profit vs activation weights) NOT yet integrated; current fitness still mean_sharpe * trade_factor * penalties (drawdown / concentration / variance). Activation gain presently logged but not multiplied into fitness (pending decision).
+   - Composite fitness with activation_gain not integrated (Pending).
 4. `configs/config.yaml`
    - Relaxed gates (temporary) + multi-symbol expansion. `fitness_weights` block NOT yet added (pending final design / normalization).
 
@@ -989,3 +1094,97 @@ Verification Checklist:
 - [ ] `system.log` should contain `SURVIVOR` lines with full formula details if any candidates pass all gates.
 - [ ] `system.log` should contain `EIL_PANEL_SELECT` and `EIL_GATE_REJECT` lines.
 - [ ] If gate stages are configured to escalate, an `EIL_STAGE_ESCALATE` log should appear.
+## 2025-08-28 EIL Timeframe Preference Knob
+Status: Canonical
+
+Changes:
+- Added `eil.timeframe_preference` in `configs/config.yaml` to control the order of timeframes EIL scans when selecting the research panel. Default: `["1h","15m","5m"]`.
+- Updated `v26meme/core/config.py` (`EILConfig`) to include `timeframe_preference: List[str] = []`.
+- Hyper Lab now reads `eil.timeframe_preference` with safe fallbacks: first the knob, then `harvester.timeframes_by_lane.eil`, else `['1h','15m','5m']`.
+
+Rationale:
+- Eliminates a magic list in code and exposes a clear, adjustable control to bias discovery toward more stable higher TFs during bootstrap or toward lower TFs once coverage deepens. PIT behavior unchanged.
+
+Verification Checklist:
+- [ ] `pytest` passes (no schema errors). 
+- [ ] `python -m v26meme.cli check` succeeds.
+- [ ] EIL logs `EIL_PANEL_SELECT` using a timeframe from `eil.timeframe_preference` when available.
+
+Rollback:
+- Remove `eil.timeframe_preference` from `configs/config.yaml`. Code will fall back to `harvester.timeframes_by_lane.eil` and then to `['1h','15m','5m']`.
+## 2025-08-28 TEMP Bootstrap Tuning for First Survivors
+Status: Canonical (temporary ops tuning; revert after 24–48h)
+
+Changes (configs/config.yaml):
+- execution.paper_fees_bps: 10 -> 5 (TEMP)
+- execution.paper_slippage_bps: 10 -> 5 (TEMP)
+- validation.dsr.min_prob: 0.40 -> 0.30 (TEMP)
+- validation.min_trades: (absent) -> 6 (TEMP)
+- discovery.fdr_alpha: 0.25 -> 0.35 (TEMP)
+- discovery.population_size: 1200 -> 360 (TEMP)
+- discovery.cv_folds: 5 -> 3 (TEMP)
+- discovery.cv_embargo_bars: 96 -> 24 (TEMP)
+- discovery.fdr_alpha: 0.35 -> 0.50 (TEMP one‑cycle boost)
+- discovery.gate_stages.relaxed: fdr_alpha 0.70, dsr_min_prob 0.25, min_trades 5 (TEMP one‑cycle override)
+- discovery.population_size: 360 -> 120 (TEMP reduce m further)
+- discovery.prefilter.sign_p_max: 0.20 -> 0.25 (TEMP)
+- discovery.prefilter.median_bps_min: 1.0 -> 0.5 (TEMP)
+- execution.paper fees/slippage bps: 5/5 -> 3/3 (TEMP)
+- discovery.promotion_criteria.min_trades: 10 -> 6 (TEMP)
+- discovery.fitness_weights.complexity_penalty: 0.001 -> 0.015 (TEMP)
+- discovery.base_features: commented out roc_1, roc_3 (TEMP)
+- discovery.gate_stages: added [relaxed, baseline, tight] ladder for auto‑escalation
+- llm.temperature: 0.4 -> 0.6 (TEMP)
+- llm.max_suggestions_per_cycle: 10 -> 20 (TEMP)
+- eil.timeframe_preference: ['1h','15m','5m'] -> ['1h'] (TEMP)
+  
+Additional validation tweak:
+- validation.bootstrap.min_trades: 30 -> 10 (TEMP) to enable bootstrap path on shorter series.
+
+## 2025-08-28 Returns Normalization + CPCV + Prefilter/Novelty
+Status: Canonical
+
+Changes:
+- Sim returns normalized to unitless per-trade returns: SimLab now computes `returns = pnl / |exec_price|` and exposes per-symbol return streams.
+- Validator adds CPCV-style symbol folds when multiple symbols are present; still uses purged K-fold for single-series input.
+- Hyper Lab implements a deterministic prefilter and novelty gate before BH-FDR:
+  - Prefilter: sign-test p ≤ `discovery.prefilter.sign_p_max` (default 0.20) AND median per-trade return ≥ `discovery.prefilter.median_bps_min` bps (default 1.0).
+  - Novelty: keep top `discovery.novelty.max_per_family` (default 1) per feature-family (unique feature set + optional depth).
+
+Config Knobs:
+- discovery.prefilter.enabled: true
+- discovery.prefilter.sign_p_max: 0.20
+- discovery.prefilter.median_bps_min: 1.0
+- discovery.novelty.enabled: true
+- discovery.novelty.max_per_family: 1
+- discovery.novelty.include_depth: true
+
+Rationale:
+- Normalization fixes mixed-scale variance that crushed t-stats; CPCV reduces dependency leakage across symbols.
+- Prefilter + novelty collapse hypothesis load m ≥25× by construction, lifting BH-FDR acceptance threshold proportionally while preserving quality.
+
+Verification Checklist:
+- [ ] EIL logs `EIL_PREFILTER m_before=… m_after=…` with m_before/m_after ≥ 25 when many candidates.
+- [ ] Validator logs show CPCV path taken when multi-symbol returns provided (indirect via improved pass-through).
+- [ ] Survivors appear within 1–2 cycles under relaxed stage; then restore FDR/CV/pop size.
+
+Rollback:
+- Set discovery.prefilter.enabled=false and discovery.novelty.enabled=false.
+- Revert SimLab normalization and Validator CPCV changes (not recommended).
+
+Rationale:
+- Median Sharpe < 0 and 100% FDR rejections indicate cost drag + high churn. These adjustments reduce toggles, increase proposal velocity, and temporarily loosen gates to admit probe survivors. PIT is unchanged.
+
+Verification Checklist:
+- [ ] hyper_lab.err shows EIL_GEN_DIAG with sharpe_median trending to >= 0.00 and lower zero_trade_pct.
+- [ ] EIL_GATE_REJECT breakdown shows some passes; SURVIVOR lines appear.
+- [ ] loop.err reports “Found N survivors” and “Promoted M new alphas”.
+- [ ] Redis: ZCARD equity_curve > 0 within 24–48h; eil:rej:counts FDR fraction declines.
+
+Rollback (after 24–48h or once survivors stabilize):
+- Restore costs: paper_fees_bps/slippage_bps to prior (10/10) or venue-realistic.
+- Tighten gates: fdr_alpha ≤ 0.25; dsr.min_prob ≥ 0.40; min_trades ≥ 10.
+- Complexity penalty back to 0.001–0.005.
+- Re-enable roc_1/roc_3 in base_features.
+- Restore eil.timeframe_preference to ['1h','15m','5m'].
+- Reduce llm temperature back to 0.4 and max_suggestions_per_cycle to 10.

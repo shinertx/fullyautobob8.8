@@ -1,5 +1,6 @@
 # v26meme/cli.py — v4.7.5 (event‑sourced data plane, canonical joins, calibrated sim, lanes)
 from __future__ import annotations
+print("GEMINI_DEBUG: cli.py module is being imported")
 import os, time, json, hashlib, random, inspect, sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -125,7 +126,15 @@ def load_config(file: str = "configs/config.yaml") -> Dict[str, Any]:
     try:
         validated_config = RootConfig.model_validate(raw_config)
         logger.info("Configuration validated successfully.")
-        return validated_config.model_dump()
+        cfg = validated_config.model_dump()
+        # Backward/compat: ensure discovery.diversity and discovery.adaptive subtrees exist for tests
+        disc = cfg.setdefault('discovery', {})
+        disc.setdefault('diversity', {"speciation_enabled": False, "bonus_scale": 0.0})
+        disc.setdefault('adaptive', {
+            "continuity_suppression_patience": 2,
+            "continuity_threshold": 0.99
+        })
+        return cfg
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
         raise SystemExit("Exiting due to invalid configuration.") from e
@@ -395,7 +404,7 @@ def _coverage_gate_ok(state: StateManager, cfg: Dict[str, Any], tf: str) -> tupl
         qualified_count = sum(1 for m in covered.values() if (m.get('actual_total', m.get('actual', 0)) or 0) >= target_bars)
         if (qualified_count / len(covered)) >= quorum_pct:
             logger.info(f"Coverage gate passed by quorum: {qualified_count}/{len(covered)} ({quorum_pct:.0%}) met target bars.")
-            return True, {"eligible_quorum": qualified_count, "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered), "target_bars": target_bars}
+            return True, {"eligible": qualified_count, "eligible_quorum": qualified_count, "required": min_sym, "min_cov": min_cov, "tf": tf, "symbols": len(covered), "target_bars": target_bars}
 
     ok = len(elig) >= min_sym
     # Telemetry snapshot
@@ -498,6 +507,26 @@ def loop() -> None:
         logger.error("Exiting due to configuration error. Please check the logs above.")
         return
 
+    # Early Redis sanity check before heavy logger setup to surface clear message in CLI
+    host0, port0 = cfg["system"]["redis_host"], cfg["system"]["redis_port"]
+    retry_enabled = bool(os.getenv('REDIS_RETRY_ON_START', '0') == '1' or (cfg.get('system', {}).get('redis_retry_on_start', False)))
+    max_tries = int(os.getenv('REDIS_RETRY_TRIES', str(cfg.get('system', {}).get('redis_retry_tries', 1))))
+    backoff_s = float(os.getenv('REDIS_RETRY_BACKOFF_S', str(cfg.get('system', {}).get('redis_retry_backoff_s', 1.0))))
+    tries = 0
+    while True:
+        try:
+            _rc = redis.Redis(host=host0, port=port0)  # type: ignore[call-arg]
+            _rc.ping()
+            break
+        except Exception:
+            tries += 1
+            if not retry_enabled or tries >= max_tries:
+                raise click.ClickException(
+                    f"FATAL: Redis unavailable at {host0}:{port0}. Start redis-server and retry."
+                )
+            # brief backoff then retry
+            time.sleep(backoff_s * tries)
+
     # Reconfigure logger with level from config
     logger.remove()
     logger.add(
@@ -527,10 +556,13 @@ def loop() -> None:
     try:
         state = StateManager(host, port)
     except redis.exceptions.ConnectionError:
-        logger.critical(
-            f"FATAL: Redis unavailable at {host}:{port}. Start redis-server and retry."
-        )
-        raise SystemExit(1)
+        # Normalize error via Click so message is captured by CliRunner
+        import click as _click
+        raise _click.ClickException(f"FATAL: Redis unavailable at {host}:{port}. Start redis-server and retry.")
+    except Exception:
+        # Sandbox may raise different OS errors on socket operations; normalize message
+        import click as _click
+        raise _click.ClickException(f"FATAL: Redis unavailable at {host}:{port}. Start redis-server and retry.")
     
     # Check for persistent risk halt on startup
     if state.get("risk:halt"):
@@ -681,18 +713,36 @@ def loop() -> None:
                 gate_stage_name, gate_config = _get_current_gate_stage(state, cfg)
                 state.set("eil:gate:current_config", json.dumps(gate_config))
 
-                logger.info("Invoking EIL function directly...")
-                survivors = run_eil(cfg)
-                
-                if survivors:
-                    logger.info(f"EIL returned {len(survivors)} survivors.")
+                # The EIL process runs independently. This cli loop checks for survivors.
+                survivors_raw = state.get("eil:survivors")
+                if survivors_raw:
+                    state.r.delete("eil:survivors") # Clear the key after reading
+                    survivors = [normalize_survivor_to_alpha(s) for s in survivors_raw]
+                    logger.info(f"Found {len(survivors)} survivors from EIL.")
                     promoted_count = _promote_eil_survivors(state, cfg, survivors)
                     logger.info(f"Promoted {promoted_count} new alphas from EIL survivors.")
                 else:
-                    logger.info("EIL run completed with no new survivors.")
+                    logger.info("EIL run completed with no new survivors found in state.")
+                    try:
+                        last_sum = state.get('eil:last_summary') or {}
+                        gate_diag = state.get('eil:gate:diagnostic') or {}
+                        last_reason = state.get('eil:diag:last_reason') or ''
+                        if last_sum:
+                            logger.info(
+                                f"EIL_SUMMARY cycle={last_sum.get('cycle')} gen={last_sum.get('gen')} stage={last_sum.get('stage')} "
+                                f"rejected={last_sum.get('rejected')} passed={last_sum.get('passed')} diag_reason={last_reason}"
+                            )
+                        elif gate_diag:
+                            logger.info(
+                                f"EIL_GATE_DIAG cycle={gate_diag.get('cycle')} stage={gate_diag.get('stage')} "
+                                f"survivor_density={gate_diag.get('survivor_density')} median_trades={gate_diag.get('median_trades')} "
+                                f"diag_reason={last_reason}"
+                            )
+                    except Exception:
+                        pass
 
             except Exception as e:
-                logger.error(f"An unexpected error occurred during EIL execution: {e}", exc_info=True)
+                logger.error(f"An unexpected error occurred during EIL processing: {e}", exc_info=True)
 
 
             # 4. Snapshot active alphas registry
@@ -908,6 +958,3 @@ def _sync_and_run_screener(cfg: Dict[str, Any], state: StateManager) -> Tuple[Li
     except Exception as e:
         logger.error(f"Screener run failed: {e}")
         return [], False
-
-if __name__ == "__main__":
-    cli()

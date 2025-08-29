@@ -193,7 +193,7 @@ class UniverseScreener:
                 
                 canonical = make_canonical(base, quote, kind="SPOT")
                 candidates.append({
-                    "canonical": canonical, "venue": venue, "venue_symbol": sym,
+                    "canonical": canonical, "display": canonical, "venue": venue, "venue_symbol": sym,
                     "base": base, "quote": quote, "price": price,
                     "spread_bps": spr, "volume_24h_usd": vol_usd, "rate": rate,
                 })

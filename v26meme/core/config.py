@@ -90,6 +90,16 @@ class DiscoveryFitnessWeightsConfig(BaseModel):
     trade_signal: float
     complexity_penalty: Optional[float] = 0.0
 
+class DiscoveryPrefilterConfig(BaseModel):
+    enabled: bool = True
+    sign_p_max: float = 0.20
+    median_bps_min: float = 1.0
+
+class DiscoveryNoveltyConfig(BaseModel):
+    enabled: bool = True
+    max_per_family: int = 1
+    include_depth: bool = True
+
 # NEW: promotion criteria sub-config to align schema with config.yaml usage
 class PromotionCriteriaConfig(BaseModel):
     min_trades: Optional[int] = None
@@ -132,6 +142,8 @@ class DiscoveryConfig(BaseModel):
     debug_relaxed_gates: bool
     fitness_weights: DiscoveryFitnessWeightsConfig
     promotion_criteria: Optional[PromotionCriteriaConfig] = None  # <-- added
+    prefilter: Optional[DiscoveryPrefilterConfig] = DiscoveryPrefilterConfig()
+    novelty: Optional[DiscoveryNoveltyConfig] = DiscoveryNoveltyConfig()
 
 class ProberConfig(BaseModel):
     enabled: bool
@@ -241,6 +253,7 @@ class EILConfig(BaseModel):
     survivor_top_k: int
     scan_batch_size: int
     max_cycles: int
+    timeframe_preference: List[str] = []
 
 class AdaptiveConfig(BaseModel):
     enabled: bool

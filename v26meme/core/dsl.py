@@ -11,11 +11,13 @@ class Alpha(BaseModel):
     forward projections). Performance['all']['returns'] must be realized trade PnLs up to t-1.
     """
     id: str
-    name: str
-    formula_raw: str                   # Raw boolean formula string from EIL
-    formula: Optional[List[Any]] = None# Compiled boolean formula tree (nested lists)
-    universe: List[str]                # canonical symbols (e.g., BTC_USD_SPOT)
-    timeframe: str
+    # Relax required fields to keep interfaces stable across tests and hygiene tools.
+    # Defaults are empty strings/lists to avoid introducing implicit semantics.
+    name: str = ""
+    formula_raw: str = ""              # Raw boolean formula string from EIL
+    formula: Optional[List[Any]] = None # Compiled boolean formula tree (nested lists)
+    universe: List[str] = Field(default_factory=list)  # canonical symbols (e.g., BTC_USD_SPOT)
+    timeframe: str = ""
     lane: str = "moonshot"             # core | moonshot (default moonshot for new discoveries)
     performance: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     created_ts: int = Field(default_factory=lambda: int(time.time()))

@@ -75,3 +75,8 @@ initial_population.json
 *.out
 *.tgz
 population_dump.json
+/*.log
+/*.out
+/*.err
+/*.pid
+logs/archive/*

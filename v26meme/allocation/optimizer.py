@@ -30,7 +30,8 @@ class PortfolioOptimizer:
         if not active_alphas:
             return {}
 
-        lanes_cfg = self.cfg.get('lanes', {})
+        # kelly fractions are nested under portfolio.lanes in provided config
+        lanes_cfg = (self.cfg.get('portfolio', {}) or {}).get('lanes', {})
         core_kelly = lanes_cfg.get('core', {}).get('kelly_fraction', 0.5)
         moonshot_kelly = lanes_cfg.get('moonshot', {}).get('kelly_fraction', 0.5)
 
@@ -69,8 +70,9 @@ class PortfolioOptimizer:
         if not combined_weights:
             return {}
 
-        floor = float(self.cfg.get('min_allocation_weight', 0.0))
-        cap = float(self.cfg.get('max_alpha_concentration', 1.0))
+        port = self.cfg.get('portfolio', {}) or {}
+        floor = float(port.get('min_allocation_weight', 0.0))
+        cap = float(port.get('max_alpha_concentration', 1.0))
         
         # Floor pass
         floored = {k: (w if w >= floor else 0.0) for k, w in combined_weights.items()}

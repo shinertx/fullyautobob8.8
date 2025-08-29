@@ -57,7 +57,12 @@ class ExecutionHandler:
         logger.info("Reconciliation cycle initiated...")
 
         # Check for an active ensemble definition first
-        ensemble_def = self.state.get_ensemble_definition()
+        ensemble_def = None
+        try:
+            if hasattr(self.state, 'get_ensemble_definition'):
+                ensemble_def = self.state.get_ensemble_definition()
+        except Exception:
+            ensemble_def = None
         if ensemble_def and self.root_cfg.get('ensemble', {}).get('enabled', False):
             logger.success("Ensemble definition found. Trading based on meta-alpha.")
             
@@ -76,7 +81,17 @@ class ExecutionHandler:
                 symbol_target[symbol] = symbol_target.get(symbol, 0.0) + float(weight)
         else:
             # Fallback to standard target weights if no ensemble is active
-            alpha_to_symbol = {a.id: a.universe[0] for a in active_alphas if a.universe}
+            alpha_to_symbol = {}
+            for a in (active_alphas or []):
+                try:
+                    if isinstance(a, dict):
+                        uid = a.get('id'); uni = a.get('universe') or []
+                    else:
+                        uid = getattr(a, 'id', None); uni = getattr(a, 'universe', [])
+                    if uid and uni:
+                        alpha_to_symbol[uid] = uni[0]
+                except Exception:
+                    continue
             symbol_target = {}
             for aid, w in (target_weights or {}).items():
                 sym = alpha_to_symbol.get(aid)

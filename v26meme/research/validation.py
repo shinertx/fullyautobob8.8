@@ -100,14 +100,14 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
       - Retains sparse win-rate binomial fallback logic.
     All operations PIT-safe (closed-bar realized returns only).
     """
-    all_returns_list = [s for s in panel_returns.values() if not s.empty]
+    all_returns_list = [s for s in panel_returns.values() if s is not None and not s.empty]
     if not all_returns_list:
-        return {"p_value": 1.0, "mean_oos": 0.0, "sharpe_oos": 0.0, "total_trades": 0, "is_fallback": True}
+        return {"p_value": 1.0, "mean_oos": 0.0, "sharpe_oos": 0.0, "total_trades": 0, "is_fallback": True, "n": 0}
 
     all_returns = pd.concat(all_returns_list).sort_index()
     n = len(all_returns)
     
-    if n < k_folds:
+    if n < k_folds and len(panel_returns) <= 1:
         # Not enough data for even one fold, use fallback for the whole series
         p_final = 1.0
         if n > 0:
@@ -128,6 +128,37 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
             "sharpe_oos": mean_ret / std_ret,
             "total_trades": n,
             "is_fallback": True,
+        }
+
+    # If multiple symbols are present, apply a simple CPCV-style symbol K-fold
+    if len(panel_returns) > 1:
+        symbols = [k for k, s in panel_returns.items() if s is not None and not s.empty]
+        if not symbols:
+            return {"p_value": 1.0, "mean_oos": 0.0, "sharpe_oos": 0.0, "total_trades": 0, "is_fallback": True, "n": 0}
+        k_sym = max(2, min(k_folds, len(symbols)))
+        oos_p_values_sym: List[float] = []
+        total_oos_trades = 0
+        for i in range(k_sym):
+            test_syms = symbols[i::k_sym]
+            if not test_syms:
+                continue
+            test_series = [panel_returns[sym].dropna() for sym in test_syms if sym in panel_returns]
+            if not test_series:
+                continue
+            test_concat = pd.concat(test_series)
+            total_oos_trades += len(test_concat)
+            if len(test_concat) >= 2:
+                t_stat, p_val = ttest_1samp(test_concat, 0)
+                p_val = p_val / 2.0 if t_stat > 0 else 1.0 - (p_val / 2.0)
+                oos_p_values_sym.append(p_val)
+        p_final = float(np.mean(oos_p_values_sym)) if oos_p_values_sym else 1.0
+        return {
+            "p_value": p_final,
+            "mean_oos": float(np.mean([s.mean() for s in all_returns_list])) if all_returns_list else 0.0,
+            "sharpe_oos": float(np.mean([s.mean() / s.std(ddof=1) for s in all_returns_list if s.std(ddof=1) > 0])) if all_returns_list else 0.0,
+            "total_trades": int(total_oos_trades),
+            "is_fallback": False,
+            "n": int(total_oos_trades),
         }
 
     indices = purged_kfold_indices(n=n, k=k_folds, embargo=embargo)
@@ -179,6 +210,7 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
             "sharpe_oos": mean_ret / std_ret,
             "total_trades": len(all_returns),
             "is_fallback": True,
+            "n": len(all_returns),
         }
 
     p_final = float(np.mean(oos_p_values)) if oos_p_values else 1.0
@@ -188,6 +220,7 @@ def panel_cv_stats(panel_returns: Dict[str, pd.Series],
         "sharpe_oos": float(np.mean(oos_sharpes)) if oos_sharpes else 0.0,
         "total_trades": total_oos_trades,
         "is_fallback": False,
+        "n": int(total_oos_trades),
     }
 
 def deflated_sharpe_ratio(returns: pd.Series, n_trials: int, sr_benchmark: float = 0.0) -> float:
@@ -315,17 +348,22 @@ class Validator:
         for alpha in evaluated_alphas:
             fid = alpha.get('alpha_id')
             trades_df = alpha.get('trades')
+            per_symbol_map = alpha.get('per_symbol') if isinstance(alpha.get('per_symbol'), dict) else None
             
-            if trades_df is None or trades_df.empty or 'pnl' not in trades_df:
+            if (trades_df is None or trades_df.empty or 'pnl' not in trades_df) and not per_symbol_map:
                 if fid: rejections["min_trades"].append(fid)
                 continue
 
-            total_trades = len(trades_df)
+            total_trades = len(trades_df) if (trades_df is not None and 'pnl' in trades_df) else sum(len(v or []) for v in per_symbol_map.values()) if per_symbol_map else 0
             if total_trades < self.min_trades_gate:
                 if fid: rejections["min_trades"].append(fid)
                 continue
 
-            panel_returns = {'panel': trades_df['pnl']}
+            if per_symbol_map:
+                # Build symbol-wise series for CPCV
+                panel_returns = {str(sym): pd.Series(vals, dtype=float) for sym, vals in per_symbol_map.items() if vals}
+            else:
+                panel_returns = {'panel': trades_df['pnl']}
             
             cv_res = panel_cv_stats(
                 panel_returns,

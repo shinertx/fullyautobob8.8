@@ -3,7 +3,7 @@ A simulation lab for backtesting trading strategies.
 This is the core backtesting engine, designed to be fast and robust for research purposes.
 """
 import logging
-from typing import Dict, Union
+from typing import Dict, Union, List
 
 import pandas as pd
 
@@ -14,13 +14,18 @@ class SimLab:
     """
     A simulation lab for backtesting trading strategies.
     """
+    def __init__(self, *, fees_bps: int = 0, slippage_bps: int = 0, min_hold_bars: int = 0):
+        # Store costs as decimal fractions
+        self.fee_pct = float(fees_bps) / 10_000.0
+        self.slip_pct = float(slippage_bps) / 10_000.0
+        self.min_hold_bars = int(min_hold_bars)
 
-    def run_backtest(self, panel: pd.DataFrame, formula: list, fee_pct: float, slippage_pct: float) -> pd.DataFrame:
+    def run_backtest(self, panel: pd.DataFrame, formula: list) -> Dict[str, Dict[str, Union[int, float, List[float]]]]:
         """
         Run a backtest for a given formula on a panel, which can be single-item or multi-item.
         """
         if panel.empty:
-            return pd.DataFrame()
+            return {"all": {"n_trades": 0, "sharpe": 0.0, "sortino": 0.0, "mdd": 0.0, "returns": []}}
 
         # --- 1. Evaluate Formula to get Signals ---
         all_signals = []
@@ -45,7 +50,7 @@ class SimLab:
                 logger.debug(f"Could not evaluate formula for single item: {e}")
 
         if not all_signals:
-            return pd.DataFrame()
+            return {"all": {"n_trades": 0, "sharpe": 0.0, "sortino": 0.0, "mdd": 0.0, "returns": []}}
 
         # --- 2. Generate Trade Edges ---
         signals_df = pd.concat(all_signals).sort_index()
@@ -58,9 +63,52 @@ class SimLab:
         else:
             panel["edges"] = panel["signals"].astype(int).diff().fillna(0)
 
-        # --- 3. Calculate PnL from Edges ---
-        trade_returns = self._calculate_trade_returns(panel, fee_pct, slippage_pct)
-        return trade_returns
+        # --- 3. Calculate PnL from Edges (then normalize to returns) ---
+        trade_df = self._calculate_trade_returns(panel, self.fee_pct, self.slip_pct)
+        if trade_df.empty:
+            return {"all": {"n_trades": 0, "sharpe": 0.0, "sortino": 0.0, "mdd": 0.0, "returns": []}}
+        # Normalize per-trade PnL by absolute execution price to produce unitless returns
+        # This improves statistical power across mixed price scales and is PIT-safe.
+        if 'exec_price' in trade_df.columns:
+            denom = trade_df['exec_price'].abs().replace(0, pd.NA)
+            r = (trade_df['pnl'] / denom).astype(float)
+        else:
+            # Fallback: scale by |close| if exec price unavailable (should not happen)
+            denom = trade_df.get('close', pd.Series(index=trade_df.index, dtype=float)).abs().replace(0, pd.NA)
+            r = (trade_df['pnl'] / denom).astype(float)
+        r = r.dropna()
+        r = r.dropna()
+        n = int(len(r))
+        mean = float(r.mean()) if n > 0 else 0.0
+        std = float(r.std(ddof=1)) if n > 1 else 0.0
+        neg = r[r < 0]
+        downside = float(neg.std(ddof=1)) if len(neg) > 1 else 0.0
+        sharpe = (mean / std) if std > 0 else 0.0
+        sortino = (mean / downside) if downside > 0 else 0.0
+        mdd = float(abs(r.cumsum().min())) if n > 0 else 0.0
+        # Build per-symbol return lists if multi-item panel
+        per_symbol: Dict[str, List[float]] = {}
+        if 'item' in trade_df.index.names:
+            try:
+                # Recompute normalized returns per symbol to avoid double computation
+                if 'exec_price' in trade_df.columns:
+                    denom_sym = trade_df['exec_price'].abs().replace(0, pd.NA)
+                    r_norm = (trade_df['pnl'] / denom_sym).astype(float)
+                else:
+                    denom_sym = trade_df.get('close', pd.Series(index=trade_df.index, dtype=float)).abs().replace(0, pd.NA)
+                    r_norm = (trade_df['pnl'] / denom_sym).astype(float)
+                r_norm = r_norm.dropna()
+                for sym, grp in r_norm.groupby(level='item'):
+                    vals = grp.dropna().astype(float).tolist()
+                    if vals:
+                        per_symbol[str(sym)] = [float(x) for x in vals]
+            except Exception:
+                per_symbol = {}
+
+        return {
+            "all": {"n_trades": n, "sharpe": sharpe, "sortino": sortino, "mdd": mdd, "returns": list(map(float, r.values))},
+            "per_symbol": per_symbol
+        }
 
     def _evaluate_formula(self, df: pd.DataFrame, formula: list) -> pd.Series:
         """
@@ -116,6 +164,26 @@ class SimLab:
         if trades.empty:
             return pd.DataFrame()
 
+        # Optional hysteresis: enforce minimum bars between consecutive edges per item
+        if self.min_hold_bars > 0:
+            try:
+                if 'item' in panel.index.names:
+                    bar_ord = panel.groupby(level='item').cumcount()
+                else:
+                    # Single-item panel
+                    bar_ord = pd.Series(range(len(panel)), index=panel.index)
+                edge_ord = bar_ord.loc[trades.index]
+                if 'item' in trades.index.names:
+                    gaps = edge_ord.groupby(level='item').diff().fillna(self.min_hold_bars)
+                else:
+                    gaps = edge_ord.diff().fillna(self.min_hold_bars)
+                trades = trades[gaps >= self.min_hold_bars].copy()
+                if trades.empty:
+                    return pd.DataFrame()
+            except Exception:
+                # If any issue computing ordinals, fall back without hysteresis
+                pass
+
         # Get the price for the NEXT bar to calculate PnL (avoids lookahead)
         is_multi_item = 'item' in panel.index.names
         if is_multi_item:
@@ -136,7 +204,9 @@ class SimLab:
         # Drop the last trade for each item if it can't be closed (no next bar to calculate PnL)
         trades = trades.dropna(subset=['pnl'])
 
-        return trades.loc[:, ["pnl"]]
+        # Keep exec_price for normalization upstream
+        cols = [c for c in ["pnl", "exec_price", "close"] if c in trades.columns]
+        return trades.loc[:, cols]
 
 
 # Example usage (for testing or ad-hoc analysis)

@@ -432,6 +432,10 @@ The system includes two Streamlit dashboards for monitoring:
     - **Command**: `streamlit run dashboard/app.py --server.port 8601`
 
 2.  **Hyper Lab Dashboard**: Shows the status of the strategy discovery process (EIL), including survivor candidates and feature analysis.
+
+Config tip: You can steer EIL's research timeframe order using `eil.timeframe_preference` (e.g., `["1h","15m","5m"]`). Hyper Lab falls back to `harvester.timeframes_by_lane.eil` and a safe default if unset.
+
+Contribution rule: Do not create new files unless absolutely necessary. Prefer patching existing modules; if a suitable file already exists, update it. New files are permitted only for logs/telemetry or when no appropriate file exists, and must be explicitly justified.
     - **URL**: `http://localhost:8610`
     - **Command**: `streamlit run dashboard/hyper_lab_app.py --server.port 8610`
 

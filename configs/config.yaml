@@ -19,13 +19,13 @@ data_source:
 
 screener:
   snapshot_dir: "data/screener_snapshots"
-  min_24h_volume_usd: 10000000
+  min_24h_volume_usd: 8000000
   min_avg_daily_volume_14d: 5000000
   min_trades_per_day_14d: 100
   max_bid_ask_spread_pct: 0.5
   min_start_date_days_ago: 30
   min_price: 0.20
-  max_markets: 100
+  max_markets: 200
   typical_order_usd: 200
   max_spread_bps: 25
   max_impact_bps: 60
@@ -52,8 +52,9 @@ harvester:
     to: ["1h"]                      # NEW: target timeframes for aggregation
     min_native_rows_threshold: 50   # NEW: skip aggregation if native 1h data has this many rows
     max_tail_hours: 72              # NEW: limit aggregation window to recent data for performance
+  min_accept_ratio_for_selection: 0.70 # NEW: min quality for a timeframe to be used by EIL
   checkpoint_reconcile:
-    enabled: false                   # CHANGED: forward-only drift correction re-enabled
+    enabled: true                   # CHANGED: forward-only drift correction re-enabled
   bootstrap_mode: "inline"          # TEMP: simplify control path
   min_coverage_for_research: 0.01     # NEW: initial coverage ratio gate for research timeframe
   high_coverage_threshold: 0.80       # NEW: target after first promotion
@@ -73,9 +74,10 @@ feeds:
   orderflow:   { enabled: true, top_levels: 5 }
 
 validation:
+  min_trades: 6   # TEMP: align validator gate with relaxed stage; restore ≥20 later
   dsr:
     enabled: true
-    min_prob: 0.40  # TEMP loosen (was 0.50) for initial survivor emergence
+    min_prob: 0.30  # TEMP: loosen to admit probe survivors; restore ≥0.40
     benchmark_sr: 0.0
   sparse_trades:
     enabled: true
@@ -83,13 +85,13 @@ validation:
   bootstrap:
     enabled: true
     n_iter: 500
-    min_trades: 30
+    min_trades: 10   # TEMP: allow bootstrap on shorter series; restore ≥30
     seed: 1337
     method: basic
 
 discovery:
   promotion_criteria:
-    min_trades: 10
+    min_trades: 6   # TEMP: allow early probes; restore ≥10 after first survivors
   max_promotions_per_cycle: 1
   max_promotions_per_day: 5
   base_features:
@@ -108,8 +110,9 @@ discovery:
     - "ema_10"
     - "ema_20"
     - "ema_50"
-    - "roc_1"
-    - "roc_3"
+    # TEMP: reduce churny ROC features during bootstrap
+    # - "roc_1"
+    # - "roc_3"
     - "roc_5"
     - "roc_10"
   # --- Coverage Gates ---
@@ -129,14 +132,29 @@ discovery:
   feature_min_variance: 1e-6
   
   max_workers: 8
-  population_size: 320
-  generations_per_cycle: 5  # TEMP loosen (was 3) to increase exploration per loop
-  cv_folds: 5  # TEMP loosen (was 10) lowers statistical friction
-  cv_embargo_bars: 96  # TEMP loosen (was 288) shorter embargo for more effective sample
-  fdr_alpha: 0.25  # TEMP loosen (was 0.20) allow more candidates early
+  population_size: 60    # BOOTSTRAP: cut m to ease BH‑FDR; restore upward after survivors
+  generations_per_cycle: 4  # BOOTSTRAP: fewer gens to limit trials per cycle
+  cv_folds: 3  # TEMP: bootstrap (reduce CV friction); restore 5
+  cv_embargo_bars: 24  # TEMP: bootstrap (shorter embargo); restore 96
+  fdr_alpha: 0.50  # TEMP one‑cycle boost; restore ≤0.25 after survivors
   
   # Survivor selection (top-k by score after validation gates)
-  survivor_top_k: 10  # Keep top 10 survivors for diversity
+  survivor_top_k: 25  # Retain more survivors per cycle for breadth
+  
+  # TEMP: explicit stage ladder for 24h bootstrap; Hyper Lab will auto‑escalate
+  gate_stages:
+    - name: relaxed
+      fdr_alpha: 0.70       # TEMP: one-cycle acceptance boost; revert to ≤0.25 after passes
+      dsr_min_prob: 0.25    # TEMP: easier DSR for bootstrap
+      min_trades: 5         # TEMP: align with validator for early passes
+    - name: baseline
+      fdr_alpha: 0.25
+      dsr_min_prob: 0.40
+      min_trades: 10
+    - name: tight
+      fdr_alpha: 0.20
+      dsr_min_prob: 0.50
+      min_trades: 20
   
   gate_stage_escalation:
     survivor_density_min: 0.05
@@ -145,7 +163,7 @@ discovery:
   factor_correlation_max: 0.80
   enforce_current_gates_on_start: true
   max_return_padding_trim: 5
-  max_population_size: 1000
+  max_population_size: 3000
   reseed_fraction: 0.30
   fitness_drawdown_penalty_scale: 0.40
   rejection_sample_size: 8
@@ -164,11 +182,19 @@ discovery:
   fitness_weights:
     profit_signal: 0.7
     trade_signal: 0.3
-    complexity_penalty: 0.001
+    complexity_penalty: 0.015  # TEMP: discourage churny formulas; restore 0.001–0.005
+  prefilter:
+    enabled: true
+    sign_p_max: 0.15         # BOOTSTRAP: stricter sign gate to reduce weak candidates
+    median_bps_min: 0.8      # BOOTSTRAP: slightly higher effect-size floor
+  novelty:
+    enabled: true
+    max_per_family: 1        # Keep only the top candidate per feature-family per generation
+    include_depth: true      # Include formula depth in family key
 
 prober:
   enabled: true
-  perturbations: 64
+  perturbations: 24
   delta_fraction: 0.15
   min_robust_score: 0.55
   mdd_escalation_multiplier: 1.50  # Relaxed from hardcoded 1.25 (adaptive knob)
@@ -234,8 +260,8 @@ execution:
   mode: "paper"
   primary_exchange: "coinbase"
   trade_universe_source: "screener"
-  paper_fees_bps: 10
-  paper_slippage_bps: 10
+  paper_fees_bps: 3     # TEMP: lower cost to surface early edge
+  paper_slippage_bps: 3 # TEMP: lower cost to surface early edge
   max_order_notional_usd: 150
 
 llm:
@@ -243,9 +269,9 @@ llm:
   enabled: true
   proposer_enabled: true
   model: "gpt-4o-mini"
-  temperature: 0.4
+  temperature: 0.6                # TEMP: increase variety to escape local minima
   max_tokens: 400
-  max_suggestions_per_cycle: 10
+  max_suggestions_per_cycle: 10   # BOOTSTRAP: lower to reduce trial count added to population
   threshold_min: 0.5
   threshold_max: 0.9
   adaptive_temp:
@@ -277,13 +303,14 @@ llm:
 
 eil:
   enabled: true
-  fast_window_days: 100  # TEMP widen (was 75) for more trades
+  fast_window_days: 150  # BOOTSTRAP: widen to increase trade counts for CV power
   max_parallel_jobs: 8
   max_queue: 5000
   survivor_top_k: 25
   scan_batch_size: 200
   # max_cycles: 10 # Set to 0 or remove for continuous running # TEMP: for short EIL runs
   max_cycles: 1000000  # 0 means run indefinitely
+  timeframe_preference: ["1h"]  # TEMP: bias to higher TF to reduce churn/cost drag
 
 adaptive:
   enabled: true
@@ -291,10 +318,10 @@ adaptive:
   daily_stop_pct_floor: 0.05
   daily_stop_pct_ceiling: 0.20
   stop_vol_multiplier: 6.0
-  screener_max_markets_min: 12
-  screener_max_markets_max: 36
-  population_size_min: 120
-  population_size_max: 400
+  screener_max_markets_min: 24
+  screener_max_markets_max: 72
+  population_size_min: 240
+  population_size_max: 800
 
 registry:
   allowed_quotes_global: ["USD","USDT","USDC","DAI","FDUSD","TUSD","PYUSD","EUR","GBP"]

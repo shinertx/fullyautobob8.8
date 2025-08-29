@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import pandas as pd
 from typing import Dict, Any
+import time as _time
 
 REQUIRED_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
 # Exposed timeframe mapping (ms) to satisfy tests and external callers needing consistency with harvester.
@@ -22,6 +23,7 @@ def validate_frame(df: pd.DataFrame, timeframe_ms: int, *, max_gap_pct: float | 
     If max_gap_pct provided and gap ratio <= threshold, mark as non-degraded while keeping gap count.
     """
     degraded = False; gaps = 0; dupes = 0; msgs: list[str] = []
+    reason = 'ok'
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         msgs.append(f"missing required columns: {missing}")
@@ -44,20 +46,36 @@ def validate_frame(df: pd.DataFrame, timeframe_ms: int, *, max_gap_pct: float | 
     df = df.sort_values("timestamp")
     before = len(df)
     df = df.drop_duplicates(subset=["timestamp"]); dupes = before - len(df)
-    gap_ratio = 0.0
-    if len(df) > 3:
-        diffs = df["timestamp"].astype("int64").diff().dropna() // 10**6
-        exp = int(timeframe_ms); gap_thresh = int(exp * 1.5)
-        gaps = int((diffs > gap_thresh).sum())
-        if gaps > 0:
+    # Drop any open (incomplete) bar at the tail (timestamp >= now)
+    # Determine if last bar is beyond the last fully closed bar boundary
+    cur_ms = int(pd.Timestamp.now(tz='UTC').value // 1_000_000)
+    if not df.empty:
+        last_ms = int(pd.to_datetime(df["timestamp"].iloc[-1]).value // 1_000_000)
+        cur_bucket_start = (cur_ms // int(timeframe_ms)) * int(timeframe_ms)
+        # Consider bar open if it belongs to the current in-progress bucket (start > bucket_start)
+        if last_ms > cur_bucket_start:
+            df = df.iloc[:-1]
             degraded = True
-            expected_intervals = max(1, len(df) + gaps - 1)
-            gap_ratio = gaps / expected_intervals
-            if max_gap_pct is not None and gap_ratio <= max_gap_pct:
-                # Accept despite gaps; downgrade degraded flag while retaining message
-                msgs.append(f"accepting with gaps={gaps} gap_ratio={gap_ratio:.3f} <= threshold {max_gap_pct:.3f}")
-                degraded = False
-    return {"degraded": degraded, "gaps": gaps, "dupes": dupes, "messages": msgs, "df": df, "gap_ratio": gap_ratio}
+            msgs.append("dropped open tail bar")
+            reason = 'open_bar_removed'
+
+    gap_ratio = 0.0
+    if len(df) > 3 and reason == 'ok':
+        # Estimate expected bars from first/last timestamps and tf step
+        ts0 = int(df['timestamp'].iloc[0].value // 1_000_000)
+        tsN = int(df['timestamp'].iloc[-1].value // 1_000_000)
+        expected = max(1, (tsN - ts0) // int(timeframe_ms) + 1)
+        missing = max(0, expected - len(df))
+        if missing > 0:
+            degraded = True
+            gap_ratio = missing / expected
+            if max_gap_pct is not None:
+                if gap_ratio <= max_gap_pct:
+                    reason = 'has_gaps'
+                else:
+                    reason = 'gap_ratio_exceeded'
+    accepted = reason != 'gap_ratio_exceeded'
+    return {"accepted": accepted, "degraded": degraded, "gaps": gaps, "dupes": dupes, "messages": msgs, "df": df, "gap_ratio": gap_ratio, "reason": reason}
 
 def atomic_write_parquet(df: pd.DataFrame, out_path: Path, quality_meta: Dict[str, Any]) -> None:
     """Atomically write parquet + sidecar quality JSON (fail‑closed semantics).
